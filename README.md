@@ -19,53 +19,44 @@
 
 ## Architecture
 
-```
-                                  ┌─────────────────────────────────────────────────┐
-  ┌───────────────────┐           │                  reports                        │
-  │   IMAP Server     │           │                                                 │
-  │  (Gmail, etc.)    │           │   ┌──────────┐   ┌──────────┐   ┌───────────┐  │
-  │                   │  IMAPS    │   │   IMAP   │──▶│   MIME   │──▶│ Gzip/Zip  │  │
-  │  ┌─────────────┐  │◀────────▶│   │  Client  │   │  Parser  │   │Decompress │  │
-  │  │ DMARC Email │  │  libcurl  │   └──────────┘   └──────────┘   └─────┬─────┘  │
-  │  │ (ZIP/GZ     │  │           │                                       │         │
-  │  │  attachment) │  │           │                       ┌──────────────┘         │
-  │  ├─────────────┤  │           │                       ▼                         │
-  │  │TLS-RPT Email│  │           │   ┌──────────┐   ┌──────────┐                  │
-  │  │ (JSON/GZ)   │  │           │   │  DMARC   │   │ MTA-STS  │                  │
-  │  └─────────────┘  │           │   │  Parser  │   │  Parser  │                  │
-  └───────────────────┘           │   │ (libxml2)│   │(std.json)│                  │
-                                  │   └────┬─────┘   └────┬─────┘                  │
-                                  │        │              │                         │
-                                  │        ▼              ▼                         │
-  ┌───────────────────┐           │   ┌─────────────────────────┐                  │
-  │   Local Storage   │◀──────────│   │        Store            │                  │
-  │                   │   JSON    │   │   (JSON file store)     │                  │
-  │ ~/.local/share/   │           │   └────────────┬────────────┘                  │
-  │  reports/         │           │                │                                │
-  │  ├── dmarc/*.json │──────────▶│   ┌────────────▼────────────┐                  │
-  │  └── tlsrpt/     │           │   │       CLI / C ABI       │                  │
-  │      *.json       │           │   │  list, show, summary    │                  │
-  └───────────────────┘           │   └────────────┬────────────┘                  │
-                                  │                │                                │
-                                  └────────────────┼────────────────────────────────┘
-                                                   │
-                             ┌─────────────────────┼──────────────────────┐
-                             │                     │                      │
-                             ▼                     ▼                      ▼
-                      ┌─────────────┐    ┌──────────────┐     ┌──────────────────┐
-                      │  Terminal   │    │  JSON stdout │     │  SwiftUI macOS   │
-                      │   (table)   │    │   (--format  │     │   (via C ABI     │
-                      │             │    │      json)   │     │  libreports-core │
-                      └─────────────┘    └──────────────┘     │       .a)        │
-                                                              └──────────────────┘
+```mermaid
+graph TD
+    subgraph IMAP Servers
+        S1[IMAP Server<br>Gmail, etc.]
+        S2[IMAP Server<br>Work, etc.]
+    end
+
+    subgraph reports
+        IMAP[IMAP Client<br><i>libcurl</i>]
+        MIME[MIME Parser<br><i>base64 decode</i>]
+        DECOMP[Decompress<br><i>gzip/zip via zlib</i>]
+        DMARC[DMARC Parser<br><i>libxml2</i>]
+        MTASTS[MTA-STS Parser<br><i>std.json</i>]
+        STORE[(Store<br>JSON files per account)]
+        CLI[CLI / C ABI<br>fetch, list, show, summary]
+    end
+
+    S1 -- IMAPS --> IMAP
+    S2 -- IMAPS --> IMAP
+    IMAP --> MIME --> DECOMP
+    DECOMP --> DMARC
+    DECOMP --> MTASTS
+    DMARC --> STORE
+    MTASTS --> STORE
+    STORE --> CLI
+
+    CLI --> Terminal[Terminal<br>table output]
+    CLI --> JSON[JSON stdout<br>--format json]
+    CLI --> Swift[SwiftUI macOS<br>via libreports-core.a]
 ```
 
 ## Features
 
 - Fetch DMARC aggregate reports (RFC 7489) and TLS-RPT reports (RFC 8460) from IMAP
+- Multiple IMAP account support with per-account storage
 - Parse XML/JSON report formats with ZIP/GZIP decompression
 - List, show, and summarize reports with table or JSON output
-- Filter by domain
+- Filter by account and domain
 - Headless core with C ABI static library for native UI integration
 
 ## Installation
@@ -102,40 +93,42 @@ Create `~/.config/reports/config.json`:
 
 ```json
 {
-  "imap": {
-    "host": "imap.gmail.com",
-    "port": 993,
-    "username": "you@gmail.com",
-    "password": "your-app-password",
-    "mailbox": "INBOX",
-    "tls": true
-  }
+  "accounts": [
+    {
+      "name": "personal",
+      "host": "imap.gmail.com",
+      "port": 993,
+      "username": "you@gmail.com",
+      "password": "your-app-password",
+      "mailbox": "INBOX",
+      "tls": true
+    }
+  ]
 }
 ```
 
 For Gmail, generate an [App Password](https://myaccount.google.com/apppasswords). Set `mailbox` to the label name if reports are filtered (e.g., `"dmarc"`).
 
+Legacy single-account format (`"imap": {...}`) is also supported and treated as a `"default"` account.
+
 ### Fetch reports
 
 ```bash
 $ reports fetch
-Searching for DMARC reports...
-Found 204 DMARC messages. Fetching...
-Searching for TLS-RPT reports...
-Fetched 186 DMARC and 0 TLS-RPT reports.
+$ reports fetch --account personal
 ```
 
 ### List reports
 
 ```bash
 $ reports list
-TYPE     ORGANIZATION              REPORT ID                      DATE              DOMAIN
--------- ------------------------- ------------------------------ ----------------- --------------------
-DMARC    google.com                12864733003343132926           2026-04-02 00:00  example.com
-DMARC    google.com                3504435274969495050            2026-04-01 00:00  example.com
+ACCOUNT    TYPE     ORGANIZATION         REPORT ID                      DATE              DOMAIN
+---------- -------- -------------------- ------------------------------ ----------------- --------------------
+personal   DMARC    google.com           12864733003343132926           2026-04-02 00:00  example.com
+personal   DMARC    google.com           3504435274969495050            2026-04-01 00:00  example.com
 ...
 
-$ reports list --domain example.com
+$ reports list --account personal --domain example.com
 $ reports list --format json
 ```
 
@@ -165,7 +158,7 @@ Total Messages:   547
 DKIM/SPF Pass:    182
 DKIM/SPF Fail:    365
 
-$ reports summary --domain example.com --format json
+$ reports summary --account personal --domain example.com --format json
 ```
 
 ## C ABI / SwiftUI Integration
