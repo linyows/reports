@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            artifact: reports-linux-amd64
+          - os: ubuntu-latest
+            target: aarch64-linux
+            artifact: reports-linux-arm64
+          - os: macos-latest
+            target: x86_64-macos
+            artifact: reports-darwin-amd64
+          - os: macos-latest
+            target: aarch64-macos
+            artifact: reports-darwin-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/\.version = \"[^\"]*\",/.version = \"${VERSION}\",/" build.zig.zon
+          rm -f build.zig.zon.bak
+          echo "Updated build.zig.zon to version ${VERSION}"
+          grep '\.version' build.zig.zon
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-dev libcurl4-openssl-dev zlib1g-dev
+
+      - name: Build
+        run: zig build --release=fast -Dtarget=${{ matrix.target }}
+
+      - name: Create archive
+        run: |
+          mkdir -p ${{ matrix.artifact }}
+          cp zig-out/bin/reports ${{ matrix.artifact }}/
+          tar -czvf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            cp "$dir$name.tar.gz" "release/"
+          done
+          cd release
+          sha256sum *.tar.gz > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*
