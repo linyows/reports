@@ -2,11 +2,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
-    imap: Imap,
+    accounts: []const Account,
     data_dir: []const u8,
     geoip_db: []const u8,
 
-    pub const Imap = struct {
+    pub const Account = struct {
+        name: []const u8,
         host: []const u8,
         port: u16 = 993,
         username: []const u8,
@@ -39,80 +40,167 @@ pub const Config = struct {
 
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
 
-        return .{
-            .imap = .{
-                .host = try allocator.dupe(u8, j.imap.host),
-                .port = j.imap.port,
-                .username = try allocator.dupe(u8, j.imap.username),
-                .password = try allocator.dupe(u8, j.imap.password),
-                .mailbox = try allocator.dupe(u8, j.imap.mailbox),
-                .tls = j.imap.tls,
-            },
-            .data_dir = if (j.data_dir) |d|
-                try allocator.dupe(u8, d)
-            else
-                try std.fs.path.join(allocator, &.{ home, ".local", "share", "reports" }),
-            .geoip_db = if (j.geoip_db) |g|
-                try allocator.dupe(u8, g)
-            else
-                try allocator.dupe(u8, ""),
-        };
+        const data_dir = if (j.data_dir) |d|
+            try allocator.dupe(u8, d)
+        else
+            try std.fs.path.join(allocator, &.{ home, ".local", "share", "reports" });
+
+        const geoip_db = if (j.geoip_db) |g|
+            try allocator.dupe(u8, g)
+        else
+            try allocator.dupe(u8, "");
+
+        // Parse accounts: prefer "accounts" array, fall back to legacy "imap" object
+        if (j.accounts) |json_accounts| {
+            var accounts = try allocator.alloc(Account, json_accounts.len);
+            for (json_accounts, 0..) |ja, i| {
+                accounts[i] = .{
+                    .name = try allocator.dupe(u8, ja.name),
+                    .host = try allocator.dupe(u8, ja.host),
+                    .port = ja.port,
+                    .username = try allocator.dupe(u8, ja.username),
+                    .password = try allocator.dupe(u8, ja.password),
+                    .mailbox = try allocator.dupe(u8, ja.mailbox),
+                    .tls = ja.tls,
+                };
+            }
+            return .{ .accounts = accounts, .data_dir = data_dir, .geoip_db = geoip_db };
+        }
+
+        if (j.imap) |imap| {
+            var accounts = try allocator.alloc(Account, 1);
+            accounts[0] = .{
+                .name = try allocator.dupe(u8, "default"),
+                .host = try allocator.dupe(u8, imap.host),
+                .port = imap.port,
+                .username = try allocator.dupe(u8, imap.username),
+                .password = try allocator.dupe(u8, imap.password),
+                .mailbox = try allocator.dupe(u8, imap.mailbox),
+                .tls = imap.tls,
+            };
+            return .{ .accounts = accounts, .data_dir = data_dir, .geoip_db = geoip_db };
+        }
+
+        // No accounts configured
+        const accounts = try allocator.alloc(Account, 0);
+        return .{ .accounts = accounts, .data_dir = data_dir, .geoip_db = geoip_db };
     }
 
     fn defaultConfig(allocator: Allocator, home: []const u8) !Config {
+        const accounts = try allocator.alloc(Account, 0);
         return .{
-            .imap = .{
-                .host = try allocator.dupe(u8, ""),
-                .port = 993,
-                .username = try allocator.dupe(u8, ""),
-                .password = try allocator.dupe(u8, ""),
-                .mailbox = try allocator.dupe(u8, "INBOX"),
-                .tls = true,
-            },
+            .accounts = accounts,
             .data_dir = try std.fs.path.join(allocator, &.{ home, ".local", "share", "reports" }),
             .geoip_db = try allocator.dupe(u8, ""),
         };
     }
 
     pub fn deinit(self: *const Config, allocator: Allocator) void {
-        allocator.free(self.imap.host);
-        allocator.free(self.imap.username);
-        allocator.free(self.imap.password);
-        allocator.free(self.imap.mailbox);
+        for (self.accounts) |a| {
+            allocator.free(a.name);
+            allocator.free(a.host);
+            allocator.free(a.username);
+            allocator.free(a.password);
+            allocator.free(a.mailbox);
+        }
+        allocator.free(self.accounts);
         allocator.free(self.data_dir);
         allocator.free(self.geoip_db);
     }
 
-    pub fn imapUrl(self: *const Config, allocator: Allocator) ![]const u8 {
-        const scheme = if (self.imap.tls) "imaps" else "imap";
-        return std.fmt.allocPrint(allocator, "{s}://{s}:{d}/{s}", .{
-            scheme, self.imap.host, self.imap.port, self.imap.mailbox,
-        });
+    pub fn getAccount(self: *const Config, name: []const u8) ?*const Account {
+        for (self.accounts) |*a| {
+            if (std.mem.eql(u8, a.name, name)) return a;
+        }
+        return null;
+    }
+
+    pub fn accountNames(self: *const Config, allocator: Allocator) ![]const []const u8 {
+        var names = try allocator.alloc([]const u8, self.accounts.len);
+        for (self.accounts, 0..) |a, i| {
+            names[i] = a.name;
+        }
+        return names;
     }
 
     pub fn ensureDataDir(self: *const Config) !void {
-        std.fs.makeDirAbsolute(self.data_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-        const dmarc_dir = try std.fs.path.join(std.heap.page_allocator, &.{ self.data_dir, "dmarc" });
-        defer std.heap.page_allocator.free(dmarc_dir);
-        std.fs.makeDirAbsolute(dmarc_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-        const tlsrpt_dir = try std.fs.path.join(std.heap.page_allocator, &.{ self.data_dir, "tlsrpt" });
-        defer std.heap.page_allocator.free(tlsrpt_dir);
-        std.fs.makeDirAbsolute(tlsrpt_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        makeDirIfNotExists(self.data_dir);
+        for (self.accounts) |a| {
+            const acct_dir = try std.fs.path.join(std.heap.page_allocator, &.{ self.data_dir, a.name });
+            defer std.heap.page_allocator.free(acct_dir);
+            makeDirIfNotExists(acct_dir);
+
+            const dmarc_dir = try std.fs.path.join(std.heap.page_allocator, &.{ acct_dir, "dmarc" });
+            defer std.heap.page_allocator.free(dmarc_dir);
+            makeDirIfNotExists(dmarc_dir);
+
+            const tlsrpt_dir = try std.fs.path.join(std.heap.page_allocator, &.{ acct_dir, "tlsrpt" });
+            defer std.heap.page_allocator.free(tlsrpt_dir);
+            makeDirIfNotExists(tlsrpt_dir);
+        }
     }
+};
+
+fn makeDirIfNotExists(path: []const u8) void {
+    std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {},
+    };
+}
+
+const JsonImapFields = struct {
+    host: []const u8,
+    port: u16 = 993,
+    username: []const u8,
+    password: []const u8,
+    mailbox: []const u8 = "INBOX",
+    tls: bool = true,
+};
+
+const JsonAccountFields = struct {
+    name: []const u8 = "default",
+    host: []const u8,
+    port: u16 = 993,
+    username: []const u8,
+    password: []const u8,
+    mailbox: []const u8 = "INBOX",
+    tls: bool = true,
+};
+
+const JsonConfig = struct {
+    accounts: ?[]const JsonAccountFields = null,
+    imap: ?JsonImapFields = null,
+    data_dir: ?[]const u8 = null,
+    geoip_db: ?[]const u8 = null,
 };
 
 // --- Tests ---
 
-test "fromJson parses full config" {
+test "fromJson parses accounts array" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "accounts": [
+        \\    { "name": "personal", "host": "imap.gmail.com", "username": "a@gmail.com", "password": "p1", "mailbox": "dmarc" },
+        \\    { "name": "work", "host": "imap.work.com", "username": "b@work.com", "password": "p2" }
+        \\  ],
+        \\  "data_dir": "/tmp/test-reports"
+        \\}
+    ;
+
+    const cfg = try Config.fromJson(allocator, json);
+    defer cfg.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.accounts.len);
+    try std.testing.expectEqualStrings("personal", cfg.accounts[0].name);
+    try std.testing.expectEqualStrings("imap.gmail.com", cfg.accounts[0].host);
+    try std.testing.expectEqualStrings("dmarc", cfg.accounts[0].mailbox);
+    try std.testing.expectEqualStrings("work", cfg.accounts[1].name);
+    try std.testing.expectEqualStrings("INBOX", cfg.accounts[1].mailbox);
+    try std.testing.expectEqualStrings("/tmp/test-reports", cfg.data_dir);
+}
+
+test "fromJson parses legacy imap as default account" {
     const allocator = std.testing.allocator;
     const json =
         \\{
@@ -123,33 +211,6 @@ test "fromJson parses full config" {
         \\    "password": "secret",
         \\    "mailbox": "INBOX",
         \\    "tls": true
-        \\  },
-        \\  "data_dir": "/tmp/reports-test",
-        \\  "geoip_db": "/usr/share/GeoIP/GeoLite2-City.mmdb"
-        \\}
-    ;
-
-    const cfg = try Config.fromJson(allocator, json);
-    defer cfg.deinit(allocator);
-
-    try std.testing.expectEqualStrings("imap.example.com", cfg.imap.host);
-    try std.testing.expectEqual(@as(u16, 993), cfg.imap.port);
-    try std.testing.expectEqualStrings("user@example.com", cfg.imap.username);
-    try std.testing.expectEqualStrings("secret", cfg.imap.password);
-    try std.testing.expectEqualStrings("INBOX", cfg.imap.mailbox);
-    try std.testing.expect(cfg.imap.tls);
-    try std.testing.expectEqualStrings("/tmp/reports-test", cfg.data_dir);
-    try std.testing.expectEqualStrings("/usr/share/GeoIP/GeoLite2-City.mmdb", cfg.geoip_db);
-}
-
-test "fromJson uses defaults for optional fields" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{
-        \\  "imap": {
-        \\    "host": "mail.test.com",
-        \\    "username": "u",
-        \\    "password": "p"
         \\  }
         \\}
     ;
@@ -157,62 +218,58 @@ test "fromJson uses defaults for optional fields" {
     const cfg = try Config.fromJson(allocator, json);
     defer cfg.deinit(allocator);
 
-    try std.testing.expectEqual(@as(u16, 993), cfg.imap.port);
-    try std.testing.expectEqualStrings("INBOX", cfg.imap.mailbox);
-    try std.testing.expect(cfg.imap.tls);
-    try std.testing.expect(cfg.data_dir.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), cfg.accounts.len);
+    try std.testing.expectEqualStrings("default", cfg.accounts[0].name);
+    try std.testing.expectEqualStrings("imap.example.com", cfg.accounts[0].host);
+    try std.testing.expectEqualStrings("user@example.com", cfg.accounts[0].username);
+}
+
+test "fromJson with no accounts or imap returns empty" {
+    const allocator = std.testing.allocator;
+    const json = "{}";
+
+    const cfg = try Config.fromJson(allocator, json);
+    defer cfg.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), cfg.accounts.len);
+}
+
+test "getAccount finds by name" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "accounts": [
+        \\    { "name": "a", "host": "h1", "username": "u1", "password": "p1" },
+        \\    { "name": "b", "host": "h2", "username": "u2", "password": "p2" }
+        \\  ]
+        \\}
+    ;
+
+    const cfg = try Config.fromJson(allocator, json);
+    defer cfg.deinit(allocator);
+
+    const a = cfg.getAccount("a");
+    try std.testing.expect(a != null);
+    try std.testing.expectEqualStrings("h1", a.?.host);
+
+    const b = cfg.getAccount("b");
+    try std.testing.expect(b != null);
+    try std.testing.expectEqualStrings("h2", b.?.host);
+
+    try std.testing.expectEqual(@as(?*const Config.Account, null), cfg.getAccount("nonexistent"));
+}
+
+test "fromJson uses defaults for optional fields" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{ "imap": { "host": "h", "username": "u", "password": "p" } }
+    ;
+
+    const cfg = try Config.fromJson(allocator, json);
+    defer cfg.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u16, 993), cfg.accounts[0].port);
+    try std.testing.expectEqualStrings("INBOX", cfg.accounts[0].mailbox);
+    try std.testing.expect(cfg.accounts[0].tls);
     try std.testing.expectEqualStrings("", cfg.geoip_db);
 }
-
-test "imapUrl generates correct url" {
-    const allocator = std.testing.allocator;
-    const cfg = Config{
-        .imap = .{
-            .host = "imap.gmail.com",
-            .port = 993,
-            .username = "u",
-            .password = "p",
-            .mailbox = "INBOX",
-            .tls = true,
-        },
-        .data_dir = "/tmp",
-        .geoip_db = "",
-    };
-
-    const url = try cfg.imapUrl(allocator);
-    defer allocator.free(url);
-    try std.testing.expectEqualStrings("imaps://imap.gmail.com:993/INBOX", url);
-}
-
-test "imapUrl with non-tls" {
-    const allocator = std.testing.allocator;
-    const cfg = Config{
-        .imap = .{
-            .host = "localhost",
-            .port = 143,
-            .username = "u",
-            .password = "p",
-            .mailbox = "dmarc",
-            .tls = false,
-        },
-        .data_dir = "/tmp",
-        .geoip_db = "",
-    };
-
-    const url = try cfg.imapUrl(allocator);
-    defer allocator.free(url);
-    try std.testing.expectEqualStrings("imap://localhost:143/dmarc", url);
-}
-
-const JsonConfig = struct {
-    imap: struct {
-        host: []const u8,
-        port: u16 = 993,
-        username: []const u8,
-        password: []const u8,
-        mailbox: []const u8 = "INBOX",
-        tls: bool = true,
-    },
-    data_dir: ?[]const u8 = null,
-    geoip_db: ?[]const u8 = null,
-};

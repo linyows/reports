@@ -10,6 +10,7 @@ pub const ReportType = enum {
 
 pub const ReportEntry = struct {
     report_type: ReportType,
+    account_name: []const u8,
     org_name: []const u8,
     report_id: []const u8,
     date_begin: []const u8,
@@ -21,13 +22,14 @@ pub const ReportEntry = struct {
 pub const Store = struct {
     allocator: Allocator,
     data_dir: []const u8,
+    account_name: []const u8,
 
-    pub fn init(allocator: Allocator, data_dir: []const u8) Store {
-        return .{ .allocator = allocator, .data_dir = data_dir };
+    pub fn init(allocator: Allocator, data_dir: []const u8, account_name: []const u8) Store {
+        return .{ .allocator = allocator, .data_dir = data_dir, .account_name = account_name };
     }
 
     pub fn saveDmarcReport(self: *const Store, report: *const dmarc.Report) !void {
-        const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, "dmarc" });
+        const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "dmarc" });
         defer self.allocator.free(dir);
 
         const filename = try std.fmt.allocPrint(self.allocator, "{s}_{s}.json", .{
@@ -47,7 +49,7 @@ pub const Store = struct {
     }
 
     pub fn saveTlsReport(self: *const Store, report: *const mtasts.Report) !void {
-        const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, "tlsrpt" });
+        const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "tlsrpt" });
         defer self.allocator.free(dir);
 
         const filename = try std.fmt.allocPrint(self.allocator, "{s}_{s}.json", .{
@@ -72,18 +74,13 @@ pub const Store = struct {
         try self.scanDir("dmarc", .dmarc, &entries);
         try self.scanDir("tlsrpt", .tlsrpt, &entries);
 
-        // Sort by date descending
-        std.mem.sortUnstable(ReportEntry, entries.items, {}, struct {
-            fn lessThan(_: void, a: ReportEntry, b: ReportEntry) bool {
-                return std.mem.order(u8, a.date_begin, b.date_begin) == .gt;
-            }
-        }.lessThan);
+        sortByDateDesc(entries.items);
 
         return entries.toOwnedSlice(self.allocator);
     }
 
     pub fn loadDmarcReport(self: *const Store, filename: []const u8) ![]const u8 {
-        const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, "dmarc", filename });
+        const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "dmarc", filename });
         defer self.allocator.free(path);
 
         const file = try std.fs.openFileAbsolute(path, .{});
@@ -92,7 +89,7 @@ pub const Store = struct {
     }
 
     pub fn loadTlsReport(self: *const Store, filename: []const u8) ![]const u8 {
-        const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, "tlsrpt", filename });
+        const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "tlsrpt", filename });
         defer self.allocator.free(path);
 
         const file = try std.fs.openFileAbsolute(path, .{});
@@ -101,7 +98,7 @@ pub const Store = struct {
     }
 
     fn scanDir(self: *const Store, subdir: []const u8, report_type: ReportType, entries: *std.ArrayList(ReportEntry)) !void {
-        const dir_path = try std.fs.path.join(self.allocator, &.{ self.data_dir, subdir });
+        const dir_path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, subdir });
         defer self.allocator.free(dir_path);
 
         var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
@@ -119,13 +116,87 @@ pub const Store = struct {
             };
             defer self.allocator.free(data);
 
-            const re = parseEntryFromJson(self.allocator, data, report_type, entry.name) catch continue;
+            const re = parseEntryFromJson(self.allocator, data, report_type, self.account_name, entry.name) catch continue;
             try entries.append(self.allocator, re);
         }
     }
 };
 
-fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: ReportType, filename: []const u8) !ReportEntry {
+/// List reports across all accounts, sorted by date descending.
+pub fn listAllReports(allocator: Allocator, data_dir: []const u8, account_names: []const []const u8) ![]ReportEntry {
+    var all: std.ArrayList(ReportEntry) = .empty;
+
+    for (account_names) |name| {
+        const st = Store.init(allocator, data_dir, name);
+        const entries = try st.listReports();
+        defer allocator.free(entries);
+        for (entries) |e| {
+            try all.append(allocator, e);
+        }
+    }
+
+    sortByDateDesc(all.items);
+
+    return all.toOwnedSlice(allocator);
+}
+
+/// Migrate legacy flat directory layout to per-account layout.
+/// Moves {data_dir}/dmarc/ and {data_dir}/tlsrpt/ into {data_dir}/default/.
+pub fn migrateToAccountDirs(data_dir: []const u8) void {
+    const allocator = std.heap.page_allocator;
+
+    // Check if legacy dmarc/ dir exists at top level
+    const legacy_dmarc = std.fs.path.join(allocator, &.{ data_dir, "dmarc" }) catch return;
+    defer allocator.free(legacy_dmarc);
+
+    const default_dir = std.fs.path.join(allocator, &.{ data_dir, "default" }) catch return;
+    defer allocator.free(default_dir);
+
+    // If default/ already exists or legacy dmarc/ doesn't exist, nothing to do
+    std.fs.accessAbsolute(default_dir, .{}) catch {
+        // default/ doesn't exist — check if legacy dirs do
+        std.fs.accessAbsolute(legacy_dmarc, .{}) catch return;
+
+        // Create default/ and move legacy dirs into it
+        std.fs.makeDirAbsolute(default_dir) catch return;
+
+        const target_dmarc = std.fs.path.join(allocator, &.{ default_dir, "dmarc" }) catch return;
+        defer allocator.free(target_dmarc);
+        std.fs.renameAbsolute(legacy_dmarc, target_dmarc) catch {};
+
+        const legacy_tlsrpt = std.fs.path.join(allocator, &.{ data_dir, "tlsrpt" }) catch return;
+        defer allocator.free(legacy_tlsrpt);
+        const target_tlsrpt = std.fs.path.join(allocator, &.{ default_dir, "tlsrpt" }) catch return;
+        defer allocator.free(target_tlsrpt);
+        std.fs.renameAbsolute(legacy_tlsrpt, target_tlsrpt) catch {};
+
+        return;
+    };
+    // default/ already exists, skip migration
+}
+
+pub fn freeReportEntries(allocator: Allocator, entries: []const ReportEntry) void {
+    for (entries) |e| {
+        allocator.free(e.account_name);
+        allocator.free(e.org_name);
+        allocator.free(e.report_id);
+        allocator.free(e.date_begin);
+        allocator.free(e.date_end);
+        allocator.free(e.domain);
+        allocator.free(e.filename);
+    }
+    allocator.free(entries);
+}
+
+fn sortByDateDesc(items: []ReportEntry) void {
+    std.mem.sortUnstable(ReportEntry, items, {}, struct {
+        fn lessThan(_: void, a: ReportEntry, b: ReportEntry) bool {
+            return std.mem.order(u8, a.date_begin, b.date_begin) == .gt;
+        }
+    }.lessThan);
+}
+
+fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: ReportType, account_name: []const u8, filename: []const u8) !ReportEntry {
     switch (report_type) {
         .dmarc => {
             const parsed = try std.json.parseFromSlice(DmarcJson, allocator, data, .{ .ignore_unknown_fields = true });
@@ -134,6 +205,7 @@ fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: Repor
 
             return .{
                 .report_type = .dmarc,
+                .account_name = try allocator.dupe(u8, account_name),
                 .org_name = try allocator.dupe(u8, j.metadata.org_name),
                 .report_id = try allocator.dupe(u8, j.metadata.report_id),
                 .date_begin = try formatTimestamp(allocator, j.metadata.date_begin),
@@ -149,6 +221,7 @@ fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: Repor
 
             return .{
                 .report_type = .tlsrpt,
+                .account_name = try allocator.dupe(u8, account_name),
                 .org_name = try allocator.dupe(u8, j.organization_name),
                 .report_id = try allocator.dupe(u8, j.report_id),
                 .date_begin = try allocator.dupe(u8, j.start_datetime),
@@ -182,134 +255,6 @@ const TlsJson = struct {
     } = &.{},
 };
 
-// --- Tests ---
-
-test "formatTimestamp formats correctly" {
-    const allocator = std.testing.allocator;
-
-    // 2023-11-14 00:00 UTC = 1699920000
-    const ts1 = try formatTimestamp(allocator, 1699920000);
-    defer allocator.free(ts1);
-    try std.testing.expectEqualStrings("2023-11-14 00:00", ts1);
-
-    // Zero returns empty string
-    const ts0 = try formatTimestamp(allocator, 0);
-    defer allocator.free(ts0);
-    try std.testing.expectEqualStrings("", ts0);
-
-    // 2024-01-01 12:30 UTC = 1704109800
-    const ts2 = try formatTimestamp(allocator, 1704109800);
-    defer allocator.free(ts2);
-    try std.testing.expectEqualStrings("2024-01-01 12:30", ts2);
-}
-
-test "parseEntryFromJson parses dmarc entry" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"metadata":{"org_name":"google.com","report_id":"123","date_begin":1700000000,"date_end":1700086400},
-        \\"policy":{"domain":"example.com"},"records":[]}
-    ;
-
-    const entry = try parseEntryFromJson(allocator, json, .dmarc, "test.json");
-    defer {
-        allocator.free(entry.org_name);
-        allocator.free(entry.report_id);
-        allocator.free(entry.date_begin);
-        allocator.free(entry.date_end);
-        allocator.free(entry.domain);
-        allocator.free(entry.filename);
-    }
-
-    try std.testing.expectEqualStrings("google.com", entry.org_name);
-    try std.testing.expectEqualStrings("123", entry.report_id);
-    try std.testing.expectEqualStrings("example.com", entry.domain);
-    try std.testing.expectEqualStrings("test.json", entry.filename);
-    try std.testing.expect(entry.date_begin.len > 0);
-}
-
-test "parseEntryFromJson parses tlsrpt entry" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"organization_name":"yahoo.com","report_id":"rpt-1",
-        \\"start_datetime":"2024-01-01","end_datetime":"2024-01-02",
-        \\"policies":[{"policy_domain":"test.com"}]}
-    ;
-
-    const entry = try parseEntryFromJson(allocator, json, .tlsrpt, "tls.json");
-    defer {
-        allocator.free(entry.org_name);
-        allocator.free(entry.report_id);
-        allocator.free(entry.date_begin);
-        allocator.free(entry.date_end);
-        allocator.free(entry.domain);
-        allocator.free(entry.filename);
-    }
-
-    try std.testing.expectEqualStrings("yahoo.com", entry.org_name);
-    try std.testing.expectEqualStrings("rpt-1", entry.report_id);
-    try std.testing.expectEqualStrings("test.com", entry.domain);
-}
-
-test "listReports sorts by date descending" {
-    const allocator = std.testing.allocator;
-
-    // Create temp directory
-    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpath(".", &tmp_buf);
-
-    // Create dmarc and tlsrpt subdirs
-    try tmp_dir.dir.makeDir("dmarc");
-    try tmp_dir.dir.makeDir("tlsrpt");
-
-    // Write test reports with different dates
-    const report_old =
-        \\{"metadata":{"org_name":"a.com","report_id":"old","date_begin":1600000000,"date_end":1600086400},"policy":{"domain":"d.com"},"records":[]}
-    ;
-    const report_new =
-        \\{"metadata":{"org_name":"b.com","report_id":"new","date_begin":1700000000,"date_end":1700086400},"policy":{"domain":"d.com"},"records":[]}
-    ;
-    const report_mid =
-        \\{"metadata":{"org_name":"c.com","report_id":"mid","date_begin":1650000000,"date_end":1650086400},"policy":{"domain":"e.com"},"records":[]}
-    ;
-
-    var dmarc_dir = try tmp_dir.dir.openDir("dmarc", .{});
-    defer dmarc_dir.close();
-
-    var f1 = try dmarc_dir.createFile("old.json", .{});
-    try f1.writeAll(report_old);
-    f1.close();
-
-    var f2 = try dmarc_dir.createFile("new.json", .{});
-    try f2.writeAll(report_new);
-    f2.close();
-
-    var f3 = try dmarc_dir.createFile("mid.json", .{});
-    try f3.writeAll(report_mid);
-    f3.close();
-
-    const st = Store.init(allocator, tmp_path);
-    const entries = try st.listReports();
-    defer {
-        for (entries) |e| {
-            allocator.free(e.org_name);
-            allocator.free(e.report_id);
-            allocator.free(e.date_begin);
-            allocator.free(e.date_end);
-            allocator.free(e.domain);
-            allocator.free(e.filename);
-        }
-        allocator.free(entries);
-    }
-
-    try std.testing.expectEqual(@as(usize, 3), entries.len);
-    // Should be sorted newest first
-    try std.testing.expectEqualStrings("new", entries[0].report_id);
-    try std.testing.expectEqualStrings("mid", entries[1].report_id);
-    try std.testing.expectEqualStrings("old", entries[2].report_id);
-}
-
 fn formatTimestamp(allocator: Allocator, ts: i64) ![]const u8 {
     if (ts == 0) return try allocator.dupe(u8, "");
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
@@ -324,4 +269,118 @@ fn formatTimestamp(allocator: Allocator, ts: i64) ![]const u8 {
         daytime.getHoursIntoDay(),
         daytime.getMinutesIntoHour(),
     });
+}
+
+// --- Tests ---
+
+test "formatTimestamp formats correctly" {
+    const allocator = std.testing.allocator;
+
+    const ts1 = try formatTimestamp(allocator, 1699920000);
+    defer allocator.free(ts1);
+    try std.testing.expectEqualStrings("2023-11-14 00:00", ts1);
+
+    const ts0 = try formatTimestamp(allocator, 0);
+    defer allocator.free(ts0);
+    try std.testing.expectEqualStrings("", ts0);
+}
+
+test "parseEntryFromJson parses dmarc entry with account" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"metadata":{"org_name":"google.com","report_id":"123","date_begin":1700000000,"date_end":1700086400},
+        \\"policy":{"domain":"example.com"},"records":[]}
+    ;
+
+    const entry = try parseEntryFromJson(allocator, json, .dmarc, "personal", "test.json");
+    defer {
+        allocator.free(entry.account_name);
+        allocator.free(entry.org_name);
+        allocator.free(entry.report_id);
+        allocator.free(entry.date_begin);
+        allocator.free(entry.date_end);
+        allocator.free(entry.domain);
+        allocator.free(entry.filename);
+    }
+
+    try std.testing.expectEqualStrings("personal", entry.account_name);
+    try std.testing.expectEqualStrings("google.com", entry.org_name);
+    try std.testing.expectEqualStrings("example.com", entry.domain);
+}
+
+test "listReports sorts by date descending with account dirs" {
+    const allocator = std.testing.allocator;
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpath(".", &tmp_buf);
+
+    // Create account/dmarc and account/tlsrpt dirs
+    try tmp_dir.dir.makePath("myacct/dmarc");
+    try tmp_dir.dir.makePath("myacct/tlsrpt");
+
+    const report_old =
+        \\{"metadata":{"org_name":"a.com","report_id":"old","date_begin":1600000000,"date_end":1600086400},"policy":{"domain":"d.com"},"records":[]}
+    ;
+    const report_new =
+        \\{"metadata":{"org_name":"b.com","report_id":"new","date_begin":1700000000,"date_end":1700086400},"policy":{"domain":"d.com"},"records":[]}
+    ;
+
+    var dmarc_dir = try tmp_dir.dir.openDir("myacct/dmarc", .{});
+    defer dmarc_dir.close();
+
+    var f1 = try dmarc_dir.createFile("old.json", .{});
+    try f1.writeAll(report_old);
+    f1.close();
+
+    var f2 = try dmarc_dir.createFile("new.json", .{});
+    try f2.writeAll(report_new);
+    f2.close();
+
+    const st = Store.init(allocator, tmp_path, "myacct");
+    const entries = try st.listReports();
+    defer freeReportEntries(allocator, entries);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("new", entries[0].report_id);
+    try std.testing.expectEqualStrings("old", entries[1].report_id);
+    try std.testing.expectEqualStrings("myacct", entries[0].account_name);
+}
+
+test "migrateToAccountDirs moves legacy dirs" {
+    const allocator = std.testing.allocator;
+    _ = allocator;
+
+    const tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &tmp_buf);
+
+    // Create legacy layout
+    try tmp_dir.dir.makeDir("dmarc");
+    try tmp_dir.dir.makeDir("tlsrpt");
+
+    // Write a test file
+    var dmarc_dir = try tmp_dir.dir.openDir("dmarc", .{});
+    defer dmarc_dir.close();
+    var f = try dmarc_dir.createFile("test.json", .{});
+    try f.writeAll("{}");
+    f.close();
+
+    // Run migration
+    migrateToAccountDirs(tmp_path);
+
+    // Verify: default/dmarc/test.json should exist
+    const result = tmp_dir.dir.openFile("default/dmarc/test.json", .{});
+    try std.testing.expect(result != error.FileNotFound);
+    if (result) |file| file.close() else |_| {}
+
+    // Legacy dmarc/ should no longer exist
+    const legacy = tmp_dir.dir.openDir("dmarc", .{});
+    if (legacy) |*d| {
+        var dir = d.*;
+        dir.close();
+        try std.testing.expect(false); // should not reach here
+    } else |_| {}
 }

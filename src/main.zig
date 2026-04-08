@@ -21,24 +21,22 @@ pub fn main() !void {
     }
 
     const command = args[1];
+    const account = getOption(args, "--account");
+    const format = getOption(args, "--format");
+    const domain = getOption(args, "--domain");
 
     if (std.mem.eql(u8, command, "fetch")) {
-        try cmdFetch(allocator);
+        try cmdFetch(allocator, account);
     } else if (std.mem.eql(u8, command, "list")) {
-        const format = getOption(args, "--format") orelse "table";
-        const domain = getOption(args, "--domain");
-        try cmdList(allocator, format, domain);
+        try cmdList(allocator, format orelse "table", domain, account);
     } else if (std.mem.eql(u8, command, "show")) {
-        if (args.len < 3) {
+        if (args.len < 3 or std.mem.startsWith(u8, args[2], "--")) {
             stderr_file.writeAll("Usage: reports show <report-id>\n") catch {};
             return;
         }
-        const format = getOption(args, "--format") orelse "table";
-        try cmdShow(allocator, args[2], format);
+        try cmdShow(allocator, args[2], format orelse "table");
     } else if (std.mem.eql(u8, command, "summary")) {
-        const format = getOption(args, "--format") orelse "json";
-        const domain = getOption(args, "--domain");
-        try cmdSummary(allocator, format, domain);
+        try cmdSummary(allocator, format orelse "json", domain, account);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage();
     } else {
@@ -49,43 +47,70 @@ pub fn main() !void {
     }
 }
 
-fn cmdFetch(allocator: std.mem.Allocator) !void {
+fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
+
+    reports.store.migrateToAccountDirs(cfg.data_dir);
     try cfg.ensureDataDir();
 
-    if (cfg.imap.host.len == 0) {
-        stderr_file.writeAll("IMAP not configured. Edit ~/.config/reports/config.json\n") catch {};
+    if (cfg.accounts.len == 0) {
+        stderr_file.writeAll("No accounts configured. Edit ~/.config/reports/config.json\n") catch {};
         return;
     }
 
     reports.imap.globalInit();
     defer reports.imap.globalCleanup();
 
+    for (cfg.accounts) |acct| {
+        if (account_filter) |filter| {
+            if (!std.mem.eql(u8, acct.name, filter)) continue;
+        }
+
+        if (acct.host.len == 0) continue;
+
+        {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "\nAccount: {s}\n", .{acct.name}) catch "";
+            stdout_file.writeAll(msg) catch {};
+        }
+
+        const result = fetchForAccount(allocator, &acct, cfg.data_dir);
+
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Fetched {d} DMARC and {d} TLS-RPT reports.\n", .{
+            result.dmarc, result.tls,
+        }) catch "Done.\n";
+        stdout_file.writeAll(msg) catch {};
+    }
+}
+
+fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8) struct { dmarc: u32, tls: u32 } {
     const client = reports.imap.Client.init(
         allocator,
-        cfg.imap.host,
-        cfg.imap.port,
-        cfg.imap.username,
-        cfg.imap.password,
-        cfg.imap.mailbox,
-        cfg.imap.tls,
+        acct.host,
+        acct.port,
+        acct.username,
+        acct.password,
+        acct.mailbox,
+        acct.tls,
     );
 
-    const st = Store.init(allocator, cfg.data_dir);
+    const st = Store.init(allocator, data_dir, acct.name);
 
+    // DMARC
     stdout_file.writeAll("Searching for DMARC reports...\n") catch {};
     const dmarc_uids = client.searchDmarcReports() catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "IMAP search failed: {s}\n", .{@errorName(err)}) catch "IMAP search failed\n";
         stderr_file.writeAll(msg) catch {};
-        return;
+        return .{ .dmarc = 0, .tls = 0 };
     };
     defer allocator.free(dmarc_uids);
 
     {
-        var buf2: [64]u8 = undefined;
-        const found_msg = std.fmt.bufPrint(&buf2, "Found {d} DMARC messages. Fetching...\n", .{dmarc_uids.len}) catch "Fetching...\n";
+        var buf: [64]u8 = undefined;
+        const found_msg = std.fmt.bufPrint(&buf, "Found {d} DMARC messages. Fetching...\n", .{dmarc_uids.len}) catch "Fetching...\n";
         stdout_file.writeAll(found_msg) catch {};
     }
 
@@ -118,14 +143,15 @@ fn cmdFetch(allocator: std.mem.Allocator) !void {
             dmarc_count += 1;
         }
     }
-
     stderr_file.writeAll("\n") catch {};
+
+    // TLS-RPT
     stdout_file.writeAll("Searching for TLS-RPT reports...\n") catch {};
     const tls_uids = client.searchTlsReports() catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "IMAP search failed: {s}\n", .{@errorName(err)}) catch "IMAP search failed\n";
         stderr_file.writeAll(msg) catch {};
-        return;
+        return .{ .dmarc = dmarc_count, .tls = 0 };
     };
     defer allocator.free(tls_uids);
 
@@ -154,27 +180,15 @@ fn cmdFetch(allocator: std.mem.Allocator) !void {
         }
     }
 
-    var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "Fetched {d} DMARC and {d} TLS-RPT reports.\n", .{ dmarc_count, tls_count }) catch "Done.\n";
-    stdout_file.writeAll(msg) catch {};
+    return .{ .dmarc = dmarc_count, .tls = tls_count };
 }
 
-fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8) !void {
+fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8, account: ?[]const u8) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
-    const st = Store.init(allocator, cfg.data_dir);
-    const entries = try st.listReports();
-    defer {
-        for (entries) |e| {
-            allocator.free(e.org_name);
-            allocator.free(e.report_id);
-            allocator.free(e.date_begin);
-            allocator.free(e.date_end);
-            allocator.free(e.domain);
-            allocator.free(e.filename);
-        }
-        allocator.free(entries);
-    }
+
+    const entries = try loadEntries(allocator, &cfg, account);
+    defer reports.store.freeReportEntries(allocator, entries);
 
     const filtered = try filterByDomain(allocator, entries, domain);
     defer allocator.free(filtered);
@@ -189,24 +203,15 @@ fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8
 fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const u8) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
-    const st = Store.init(allocator, cfg.data_dir);
-    const entries = try st.listReports();
-    defer {
-        for (entries) |e| {
-            allocator.free(e.org_name);
-            allocator.free(e.report_id);
-            allocator.free(e.date_begin);
-            allocator.free(e.date_end);
-            allocator.free(e.domain);
-            allocator.free(e.filename);
-        }
-        allocator.free(entries);
-    }
+
+    const entries = try loadEntries(allocator, &cfg, null);
+    defer reports.store.freeReportEntries(allocator, entries);
 
     for (entries) |entry| {
         if (std.mem.indexOf(u8, entry.report_id, report_id) != null or
             std.mem.indexOf(u8, entry.filename, report_id) != null)
         {
+            const st = Store.init(allocator, cfg.data_dir, entry.account_name);
             switch (entry.report_type) {
                 .dmarc => {
                     const data = try st.loadDmarcReport(entry.filename);
@@ -240,22 +245,12 @@ fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const 
     stderr_file.writeAll("\n") catch {};
 }
 
-fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8) !void {
+fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8, account: ?[]const u8) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
-    const st = Store.init(allocator, cfg.data_dir);
-    const entries = try st.listReports();
-    defer {
-        for (entries) |e| {
-            allocator.free(e.org_name);
-            allocator.free(e.report_id);
-            allocator.free(e.date_begin);
-            allocator.free(e.date_end);
-            allocator.free(e.domain);
-            allocator.free(e.filename);
-        }
-        allocator.free(entries);
-    }
+
+    const entries = try loadEntries(allocator, &cfg, account);
+    defer reports.store.freeReportEntries(allocator, entries);
 
     const filtered = try filterByDomain(allocator, entries, domain);
     defer allocator.free(filtered);
@@ -267,6 +262,7 @@ fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const
     var fail_count: u64 = 0;
 
     for (filtered) |entry| {
+        const st = Store.init(allocator, cfg.data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
                 total_dmarc += 1;
@@ -300,6 +296,17 @@ fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const
             stdout_file.writeAll(msg) catch {};
         }
     }
+}
+
+fn loadEntries(allocator: std.mem.Allocator, cfg: *const Config, account: ?[]const u8) ![]reports.store.ReportEntry {
+    reports.store.migrateToAccountDirs(cfg.data_dir);
+    if (account) |name| {
+        const st = Store.init(allocator, cfg.data_dir, name);
+        return st.listReports();
+    }
+    const names = try cfg.accountNames(allocator);
+    defer allocator.free(names);
+    return reports.store.listAllReports(allocator, cfg.data_dir, names);
 }
 
 fn accumulateDmarcStats(allocator: std.mem.Allocator, data: []const u8, total: *u64, pass: *u64, fail: *u64) void {
@@ -339,15 +346,16 @@ const DmarcStatsJson = struct {
 };
 
 fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.ReportEntry) !void {
+    _ = allocator;
     var buf: [512]u8 = undefined;
 
-    const header = std.fmt.bufPrint(&buf, "{s:<8} {s:<25} {s:<30} {s:<17} {s:<20}\n", .{
-        "TYPE", "ORGANIZATION", "REPORT ID", "DATE", "DOMAIN",
+    const header = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<30} {s:<17} {s:<20}\n", .{
+        "ACCOUNT", "TYPE", "ORGANIZATION", "REPORT ID", "DATE", "DOMAIN",
     }) catch return;
     stdout_file.writeAll(header) catch {};
 
-    const sep = std.fmt.bufPrint(&buf, "{s:-<8} {s:-<25} {s:-<30} {s:-<17} {s:-<20}\n", .{
-        "", "", "", "", "",
+    const sep = std.fmt.bufPrint(&buf, "{s:-<10} {s:-<8} {s:-<20} {s:-<30} {s:-<17} {s:-<20}\n", .{
+        "", "", "", "", "", "",
     }) catch return;
     stdout_file.writeAll(sep) catch {};
 
@@ -356,16 +364,16 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
             .dmarc => "DMARC",
             .tlsrpt => "TLS-RPT",
         };
-        const line = std.fmt.bufPrint(&buf, "{s:<8} {s:<25} {s:<30} {s:<17} {s:<20}\n", .{
+        const line = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<30} {s:<17} {s:<20}\n", .{
+            truncate(e.account_name, 9),
             type_str,
-            truncate(e.org_name, 24),
+            truncate(e.org_name, 19),
             truncate(e.report_id, 29),
             truncate(e.date_begin, 16),
             truncate(e.domain, 19),
         }) catch continue;
         stdout_file.writeAll(line) catch {};
     }
-    _ = allocator;
 }
 
 fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.ReportEntry) !void {
@@ -376,8 +384,8 @@ fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.Re
             .dmarc => "dmarc",
             .tlsrpt => "tlsrpt",
         };
-        const json_entry = try std.fmt.allocPrint(allocator, "\n  {{\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\"}}", .{
-            type_str, e.org_name, e.report_id, e.date_begin, e.domain,
+        const json_entry = try std.fmt.allocPrint(allocator, "\n  {{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\"}}", .{
+            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain,
         });
         defer allocator.free(json_entry);
         stdout_file.writeAll(json_entry) catch {};
@@ -516,14 +524,15 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  fetch                        Fetch reports from IMAP
-        \\  list [--format] [--domain]   List reports (table|json)
-        \\  show <id> [--format]         Show report details (table|json)
-        \\  summary [--format] [--domain] Show summary statistics (table|json)
+        \\  list                         List reports
+        \\  show <id>                    Show report details
+        \\  summary                      Show summary statistics
         \\  help                         Show this help
         \\
         \\Options:
-        \\  --format <table|json>   Output format (default: table)
-        \\  --domain <domain>       Filter by domain
+        \\  --account <name>    Target specific account (default: all)
+        \\  --format <table|json> Output format (default: table)
+        \\  --domain <domain>   Filter by domain
         \\
         \\Configuration: ~/.config/reports/config.json
         \\
