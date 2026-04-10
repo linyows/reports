@@ -7,6 +7,13 @@ const Store = reports.store.Store;
 const stdout_file = std.fs.File.stdout();
 const stderr_file = std.fs.File.stderr();
 
+const logo_text = @embedFile("assets/logo.txt");
+const desc_text = @embedFile("assets/desc.txt");
+
+const neon_yellow = "\x1b[38;2;194;255;38m";
+const dim = "\x1b[2m";
+const reset = "\x1b[0m";
+
 pub fn main() !void {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
@@ -750,7 +757,14 @@ fn truncate(s: []const u8, max: usize) []const u8 {
 }
 
 fn printUsage() void {
+    stdout_file.writeAll(neon_yellow) catch {};
+    stdout_file.writeAll(logo_text) catch {};
+    stdout_file.writeAll(reset) catch {};
+    stdout_file.writeAll(dim) catch {};
+    stdout_file.writeAll(desc_text) catch {};
+    stdout_file.writeAll(reset) catch {};
     stdout_file.writeAll(
+        \\
         \\Usage: reports <command> [options]
         \\
         \\Commands:
