@@ -1,12 +1,8 @@
-<br><br><br><br><br><br>
-
 <p align="center">
   <img src="https://github.com/linyows/reports/blob/main/misc/reports.svg?raw=true" alt="REPORTS" />
   <br><br>
   DMARC and MTA-STS report viewer
 </p>
-
-<br><br><br><br>
 
 <p align="center">
   <a href="https://github.com/linyows/reports/actions/workflows/test.yml">
