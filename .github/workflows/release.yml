@@ -17,16 +17,12 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-linux
             artifact: reports-linux-amd64
-          - os: ubuntu-latest
-            target: aarch64-linux
+          - os: ubuntu-24.04-arm
             artifact: reports-linux-arm64
-          - os: macos-latest
-            target: x86_64-macos
+          - os: macos-13
             artifact: reports-darwin-amd64
           - os: macos-latest
-            target: aarch64-macos
             artifact: reports-darwin-arm64
 
     steps:
@@ -52,8 +48,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxml2-dev libcurl4-openssl-dev zlib1g-dev
 
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libxml2 curl
+
       - name: Build
-        run: zig build --release=fast -Dtarget=${{ matrix.target }}
+        run: zig build --release=fast
 
       - name: Create archive
         run: |
