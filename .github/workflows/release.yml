@@ -20,8 +20,6 @@ jobs:
             artifact: reports-linux-amd64
           - os: ubuntu-24.04-arm
             artifact: reports-linux-arm64
-          - os: macos-13
-            artifact: reports-darwin-amd64
           - os: macos-latest
             artifact: reports-darwin-arm64
 
