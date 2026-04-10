@@ -24,6 +24,7 @@ pub fn main() !void {
     const account = getOption(args, "--account");
     const format = getOption(args, "--format");
     const domain = getOption(args, "--domain");
+    const period = getOption(args, "--period");
 
     if (std.mem.eql(u8, command, "fetch")) {
         try cmdFetch(allocator, account);
@@ -35,8 +36,10 @@ pub fn main() !void {
             return;
         }
         try cmdShow(allocator, args[2], format orelse "table");
+    } else if (std.mem.eql(u8, command, "domains")) {
+        try cmdDomains(allocator, format orelse "table", account);
     } else if (std.mem.eql(u8, command, "summary")) {
-        try cmdSummary(allocator, format orelse "json", domain, account);
+        try cmdSummary(allocator, format orelse "json", domain, account, period);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage();
     } else {
@@ -183,6 +186,54 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     return .{ .dmarc = dmarc_count, .tls = tls_count };
 }
 
+fn cmdDomains(allocator: std.mem.Allocator, format: []const u8, account: ?[]const u8) !void {
+    const cfg = try Config.load(allocator);
+    defer cfg.deinit(allocator);
+
+    const entries = try loadEntries(allocator, &cfg, account);
+    defer reports.store.freeReportEntries(allocator, entries);
+
+    // Collect unique domains
+    var domain_set = std.StringHashMap(void).init(allocator);
+    defer domain_set.deinit();
+
+    for (entries) |e| {
+        if (e.domain.len > 0) {
+            domain_set.put(e.domain, {}) catch continue;
+        }
+    }
+
+    var domains: std.ArrayList([]const u8) = .empty;
+    defer domains.deinit(allocator);
+    {
+        var it = domain_set.iterator();
+        while (it.next()) |kv| {
+            domains.append(allocator, kv.key_ptr.*) catch continue;
+        }
+    }
+    std.mem.sortUnstable([]const u8, domains.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    if (std.mem.eql(u8, format, "json")) {
+        stdout_file.writeAll("[") catch {};
+        for (domains.items, 0..) |d, i| {
+            if (i > 0) stdout_file.writeAll(",") catch {};
+            const entry = std.fmt.allocPrint(allocator, "\"{s}\"", .{d}) catch continue;
+            defer allocator.free(entry);
+            stdout_file.writeAll(entry) catch {};
+        }
+        stdout_file.writeAll("]\n") catch {};
+    } else {
+        for (domains.items) |d| {
+            stdout_file.writeAll(d) catch {};
+            stdout_file.writeAll("\n") catch {};
+        }
+    }
+}
+
 fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8, account: ?[]const u8) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
@@ -245,7 +296,15 @@ fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const 
     stderr_file.writeAll("\n") catch {};
 }
 
-fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8, account: ?[]const u8) !void {
+const PeriodStats = struct {
+    dmarc: u32 = 0,
+    tlsrpt: u32 = 0,
+    messages: u64 = 0,
+    pass: u64 = 0,
+    fail: u64 = 0,
+};
+
+fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8, account: ?[]const u8, period: ?[]const u8) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
 
@@ -255,23 +314,31 @@ fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const
     const filtered = try filterByDomain(allocator, entries, domain);
     defer allocator.free(filtered);
 
-    var total_dmarc: u32 = 0;
-    var total_tlsrpt: u32 = 0;
-    var total_messages: u64 = 0;
-    var pass_count: u64 = 0;
-    var fail_count: u64 = 0;
+    if (period) |p| {
+        if (!std.mem.eql(u8, p, "week") and !std.mem.eql(u8, p, "month") and !std.mem.eql(u8, p, "year")) {
+            stderr_file.writeAll("Invalid period: use week, month, or year\n") catch {};
+            return;
+        }
+        try cmdSummaryByPeriod(allocator, &cfg, filtered, format, p);
+    } else {
+        try cmdSummaryTotal(allocator, &cfg, filtered, format);
+    }
+}
+
+fn cmdSummaryTotal(allocator: std.mem.Allocator, cfg: *const Config, filtered: []const reports.store.ReportEntry, format: []const u8) !void {
+    var stats: PeriodStats = .{};
 
     for (filtered) |entry| {
         const st = Store.init(allocator, cfg.data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
-                total_dmarc += 1;
+                stats.dmarc += 1;
                 const data = st.loadDmarcReport(entry.filename) catch continue;
                 defer allocator.free(data);
-                accumulateDmarcStats(allocator, data, &total_messages, &pass_count, &fail_count);
+                accumulateDmarcStats(allocator, data, &stats.messages, &stats.pass, &stats.fail);
             },
             .tlsrpt => {
-                total_tlsrpt += 1;
+                stats.tlsrpt += 1;
             },
         }
     }
@@ -281,20 +348,181 @@ fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const
         const msg = std.fmt.bufPrint(&buf,
             \\{{"dmarc_reports":{d},"tlsrpt_reports":{d},"total_messages":{d},"dkim_spf_pass":{d},"dkim_spf_fail":{d}}}
             \\
-        , .{ total_dmarc, total_tlsrpt, total_messages, pass_count, fail_count }) catch return;
+        , .{ stats.dmarc, stats.tlsrpt, stats.messages, stats.pass, stats.fail }) catch return;
         stdout_file.writeAll(msg) catch {};
     } else {
         const labels = [_]struct { label: []const u8, value: u64 }{
-            .{ .label = "DMARC Reports:    ", .value = total_dmarc },
-            .{ .label = "TLS-RPT Reports:  ", .value = total_tlsrpt },
-            .{ .label = "Total Messages:   ", .value = total_messages },
-            .{ .label = "DKIM/SPF Pass:    ", .value = pass_count },
-            .{ .label = "DKIM/SPF Fail:    ", .value = fail_count },
+            .{ .label = "DMARC Reports:    ", .value = stats.dmarc },
+            .{ .label = "TLS-RPT Reports:  ", .value = stats.tlsrpt },
+            .{ .label = "Total Messages:   ", .value = stats.messages },
+            .{ .label = "DKIM/SPF Pass:    ", .value = stats.pass },
+            .{ .label = "DKIM/SPF Fail:    ", .value = stats.fail },
         };
         for (labels) |entry| {
             const msg = std.fmt.bufPrint(&buf, "{s}{d}\n", .{ entry.label, entry.value }) catch continue;
             stdout_file.writeAll(msg) catch {};
         }
+    }
+}
+
+fn cmdSummaryByPeriod(allocator: std.mem.Allocator, cfg: *const Config, filtered: []const reports.store.ReportEntry, format: []const u8, period: []const u8) !void {
+    var period_map = std.StringHashMap(PeriodStats).init(allocator);
+    defer {
+        var it = period_map.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        period_map.deinit();
+    }
+
+    for (filtered) |entry| {
+        const key = periodKey(allocator, entry.date_begin, period) catch continue;
+        const gop = try period_map.getOrPut(key);
+        if (gop.found_existing) {
+            allocator.free(key);
+        }
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+
+        const st = Store.init(allocator, cfg.data_dir, entry.account_name);
+        switch (entry.report_type) {
+            .dmarc => {
+                gop.value_ptr.dmarc += 1;
+                const data = st.loadDmarcReport(entry.filename) catch continue;
+                defer allocator.free(data);
+                accumulateDmarcStats(allocator, data, &gop.value_ptr.messages, &gop.value_ptr.pass, &gop.value_ptr.fail);
+            },
+            .tlsrpt => {
+                gop.value_ptr.tlsrpt += 1;
+            },
+        }
+    }
+
+    // Collect and sort keys
+    const keys = try allocator.alloc([]const u8, period_map.count());
+    defer allocator.free(keys);
+    {
+        var it = period_map.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| {
+            keys[i] = kv.key_ptr.*;
+            i += 1;
+        }
+    }
+    std.mem.sortUnstable([]const u8, keys, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .gt;
+        }
+    }.lessThan);
+
+    if (std.mem.eql(u8, format, "json")) {
+        try writePeriodJson(allocator, keys, &period_map);
+    } else {
+        try writePeriodTable(keys, &period_map);
+    }
+}
+
+fn periodKey(allocator: std.mem.Allocator, date_begin: []const u8, period: []const u8) ![]u8 {
+    // date_begin format: "YYYY-MM-DD HH:MM"
+    if (date_begin.len < 10) return error.InvalidDate;
+
+    if (std.mem.eql(u8, period, "year")) {
+        return try allocator.dupe(u8, date_begin[0..4]);
+    } else if (std.mem.eql(u8, period, "month")) {
+        return try allocator.dupe(u8, date_begin[0..7]);
+    } else {
+        // week: compute ISO week from YYYY-MM-DD
+        const year = std.fmt.parseInt(u16, date_begin[0..4], 10) catch return error.InvalidDate;
+        const month = std.fmt.parseInt(u8, date_begin[5..7], 10) catch return error.InvalidDate;
+        const day = std.fmt.parseInt(u8, date_begin[8..10], 10) catch return error.InvalidDate;
+        const wk = isoWeek(year, month, day);
+        return std.fmt.allocPrint(allocator, "{d:0>4}-W{d:0>2}", .{ wk.year, wk.week });
+    }
+}
+
+fn isoWeek(year: u16, month: u8, day: u8) struct { year: u16, week: u8 } {
+    // Day of week: 1=Monday ... 7=Sunday (ISO)
+    const dow = dayOfWeek(year, month, day);
+    // Ordinal day of year
+    const yday = dayOfYear(year, month, day);
+    // ISO week calculation: find Thursday of the same week
+    // Thursday's ordinal = yday + (4 - dow)
+    const thu_yday: i32 = @as(i32, @intCast(yday)) + 4 - @as(i32, @intCast(dow));
+
+    if (thu_yday < 1) {
+        // Thursday is in the previous year
+        const prev_year = year - 1;
+        const prev_days: u16 = if (isLeapYear(prev_year)) 366 else 365;
+        const adj_thu: u16 = @intCast(@as(i32, @intCast(prev_days)) + thu_yday);
+        const wk: u8 = @intCast((adj_thu - 1) / 7 + 1);
+        return .{ .year = prev_year, .week = wk };
+    }
+
+    const days_in_year: u16 = if (isLeapYear(year)) 366 else 365;
+    if (thu_yday > days_in_year) {
+        // Thursday is in the next year
+        return .{ .year = year + 1, .week = 1 };
+    }
+
+    const wk: u8 = @intCast((@as(u16, @intCast(thu_yday)) - 1) / 7 + 1);
+    return .{ .year = year, .week = wk };
+}
+
+fn dayOfWeek(year: u16, month: u8, day: u8) u8 {
+    // Tomohiko Sakamoto's algorithm: returns 0=Sunday..6=Saturday
+    const t = [_]u8{ 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    var y: i32 = @intCast(year);
+    if (month < 3) y -= 1;
+    const uy: u32 = @intCast(y);
+    const r: u32 = (uy + uy / 4 - uy / 100 + uy / 400 + t[month - 1] + day) % 7;
+    // Convert to ISO: 1=Monday..7=Sunday
+    if (r == 0) return 7;
+    return @intCast(r);
+}
+
+fn dayOfYear(year: u16, month: u8, day: u8) u16 {
+    const days_before = [_]u16{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    var d: u16 = days_before[month - 1] + day;
+    if (month > 2 and isLeapYear(year)) d += 1;
+    return d;
+}
+
+fn isLeapYear(year: u16) bool {
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
+}
+
+fn writePeriodJson(allocator: std.mem.Allocator, keys: []const []const u8, map: *const std.StringHashMap(PeriodStats)) !void {
+    stdout_file.writeAll("[") catch {};
+    for (keys, 0..) |key, i| {
+        if (i > 0) stdout_file.writeAll(",") catch {};
+        const s = map.get(key) orelse continue;
+        const line = try std.fmt.allocPrint(allocator,
+            \\
+            \\  {{"period":"{s}","dmarc_reports":{d},"tlsrpt_reports":{d},"total_messages":{d},"dkim_spf_pass":{d},"dkim_spf_fail":{d}}}
+        , .{ key, s.dmarc, s.tlsrpt, s.messages, s.pass, s.fail });
+        defer allocator.free(line);
+        stdout_file.writeAll(line) catch {};
+    }
+    stdout_file.writeAll("\n]\n") catch {};
+}
+
+fn writePeriodTable(keys: []const []const u8, map: *const std.StringHashMap(PeriodStats)) !void {
+    var buf: [512]u8 = undefined;
+    const header = std.fmt.bufPrint(&buf, "{s:<12} {s:>6} {s:>8} {s:>10} {s:>8} {s:>8}\n", .{
+        "PERIOD", "DMARC", "TLS-RPT", "MESSAGES", "PASS", "FAIL",
+    }) catch return;
+    stdout_file.writeAll(header) catch {};
+
+    const sep = std.fmt.bufPrint(&buf, "{s:-<12} {s:->6} {s:->8} {s:->10} {s:->8} {s:->8}\n", .{
+        "", "", "", "", "", "",
+    }) catch return;
+    stdout_file.writeAll(sep) catch {};
+
+    for (keys) |key| {
+        const s = map.get(key) orelse continue;
+        const line = std.fmt.bufPrint(&buf, "{s:<12} {d:>6} {d:>8} {d:>10} {d:>8} {d:>8}\n", .{
+            key, s.dmarc, s.tlsrpt, s.messages, s.pass, s.fail,
+        }) catch continue;
+        stdout_file.writeAll(line) catch {};
     }
 }
 
@@ -527,12 +755,14 @@ fn printUsage() void {
         \\  list                         List reports
         \\  show <id>                    Show report details
         \\  summary                      Show summary statistics
+        \\  domains                      List domains
         \\  help                         Show this help
         \\
         \\Options:
-        \\  --account <name>    Target specific account (default: all)
+        \\  --account <name>      Target specific account (default: all)
         \\  --format <table|json> Output format (default: table)
-        \\  --domain <domain>   Filter by domain
+        \\  --domain <domain>     Filter by domain
+        \\  --period <week|month|year> Group summary by period
         \\
         \\Configuration: ~/.config/reports/config.json
         \\
@@ -546,4 +776,91 @@ fn getOption(args: []const []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+// --- Tests ---
+
+test "dayOfWeek returns correct ISO day" {
+    // 2024-01-01 is Monday
+    try std.testing.expectEqual(@as(u8, 1), dayOfWeek(2024, 1, 1));
+    // 2023-12-31 is Sunday
+    try std.testing.expectEqual(@as(u8, 7), dayOfWeek(2023, 12, 31));
+    // 2026-04-10 is Friday
+    try std.testing.expectEqual(@as(u8, 5), dayOfWeek(2026, 4, 10));
+    // 2000-01-01 is Saturday
+    try std.testing.expectEqual(@as(u8, 6), dayOfWeek(2000, 1, 1));
+}
+
+test "dayOfYear returns correct ordinal" {
+    try std.testing.expectEqual(@as(u16, 1), dayOfYear(2024, 1, 1));
+    try std.testing.expectEqual(@as(u16, 32), dayOfYear(2024, 2, 1));
+    try std.testing.expectEqual(@as(u16, 366), dayOfYear(2024, 12, 31)); // leap year
+    try std.testing.expectEqual(@as(u16, 365), dayOfYear(2023, 12, 31)); // non-leap
+    try std.testing.expectEqual(@as(u16, 60), dayOfYear(2024, 2, 29)); // leap day
+}
+
+test "isLeapYear" {
+    try std.testing.expect(isLeapYear(2024));
+    try std.testing.expect(!isLeapYear(2023));
+    try std.testing.expect(isLeapYear(2000));
+    try std.testing.expect(!isLeapYear(1900));
+}
+
+test "isoWeek known dates" {
+    // 2024-01-01 (Mon) is W01 of 2024
+    const w1 = isoWeek(2024, 1, 1);
+    try std.testing.expectEqual(@as(u16, 2024), w1.year);
+    try std.testing.expectEqual(@as(u8, 1), w1.week);
+
+    // 2023-01-01 (Sun) is W52 of 2022
+    const w2 = isoWeek(2023, 1, 1);
+    try std.testing.expectEqual(@as(u16, 2022), w2.year);
+    try std.testing.expectEqual(@as(u8, 52), w2.week);
+
+    // 2020-12-31 (Thu) is W53 of 2020
+    const w3 = isoWeek(2020, 12, 31);
+    try std.testing.expectEqual(@as(u16, 2020), w3.year);
+    try std.testing.expectEqual(@as(u8, 53), w3.week);
+
+    // 2021-01-01 (Fri) is W53 of 2020
+    const w4 = isoWeek(2021, 1, 1);
+    try std.testing.expectEqual(@as(u16, 2020), w4.year);
+    try std.testing.expectEqual(@as(u8, 53), w4.week);
+
+    // 2026-12-31 (Thu) is W53 of 2026
+    const w5 = isoWeek(2026, 12, 31);
+    try std.testing.expectEqual(@as(u16, 2026), w5.year);
+    try std.testing.expectEqual(@as(u8, 53), w5.week);
+}
+
+test "periodKey year extracts YYYY" {
+    const allocator = std.testing.allocator;
+    const key = try periodKey(allocator, "2024-03-15 12:00", "year");
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("2024", key);
+}
+
+test "periodKey month extracts YYYY-MM" {
+    const allocator = std.testing.allocator;
+    const key = try periodKey(allocator, "2024-03-15 12:00", "month");
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("2024-03", key);
+}
+
+test "periodKey week computes ISO week" {
+    const allocator = std.testing.allocator;
+    // 2024-01-01 is Monday of W01
+    const key1 = try periodKey(allocator, "2024-01-01 00:00", "week");
+    defer allocator.free(key1);
+    try std.testing.expectEqualStrings("2024-W01", key1);
+
+    // 2023-01-01 is Sunday, belongs to 2022-W52
+    const key2 = try periodKey(allocator, "2023-01-01 00:00", "week");
+    defer allocator.free(key2);
+    try std.testing.expectEqualStrings("2022-W52", key2);
+}
+
+test "periodKey returns error for short date" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024", "year"));
 }
