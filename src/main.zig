@@ -375,11 +375,13 @@ fn cmdSummaryByPeriod(allocator: std.mem.Allocator, cfg: *const Config, filtered
 
     for (filtered) |entry| {
         const key = periodKey(allocator, entry.date_begin, period) catch continue;
-        const gop = try period_map.getOrPut(key);
+        const gop = period_map.getOrPut(key) catch {
+            allocator.free(key);
+            continue;
+        };
         if (gop.found_existing) {
             allocator.free(key);
-        }
-        if (!gop.found_existing) {
+        } else {
             gop.value_ptr.* = .{};
         }
 
@@ -434,6 +436,7 @@ fn periodKey(allocator: std.mem.Allocator, date_begin: []const u8, period: []con
         const year = std.fmt.parseInt(u16, date_begin[0..4], 10) catch return error.InvalidDate;
         const month = std.fmt.parseInt(u8, date_begin[5..7], 10) catch return error.InvalidDate;
         const day = std.fmt.parseInt(u8, date_begin[8..10], 10) catch return error.InvalidDate;
+        if (month < 1 or month > 12 or day < 1 or day > 31) return error.InvalidDate;
         const wk = isoWeek(year, month, day);
         return std.fmt.allocPrint(allocator, "{d:0>4}-W{d:0>2}", .{ wk.year, wk.week });
     }
@@ -863,4 +866,12 @@ test "periodKey week computes ISO week" {
 test "periodKey returns error for short date" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024", "year"));
+}
+
+test "periodKey returns error for invalid month or day" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-00-15 00:00", "week"));
+    try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-13-15 00:00", "week"));
+    try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-06-00 00:00", "week"));
+    try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-06-32 00:00", "week"));
 }
