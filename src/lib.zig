@@ -59,14 +59,19 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
                 allocator.free(attachments);
             }
 
+            var saved = false;
             for (attachments) |att| {
                 const xml_data = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
                 defer allocator.free(xml_data);
                 const report = reports.dmarc.parseXml(allocator, xml_data) catch continue;
+                defer report.deinit(allocator);
                 st.saveDmarcReport(&report) catch continue;
+                saved = true;
             }
-            st.markUidFetched(uid);
-            fetched_set.put(uid, {}) catch {};
+            if (saved) {
+                st.markUidFetched(uid);
+                fetched_set.put(uid, {}) catch {};
+            }
         }
 
         // TLS-RPT
@@ -88,14 +93,19 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
                 allocator.free(attachments);
             }
 
+            var tls_saved = false;
             for (attachments) |att| {
                 const json_data = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
                 defer allocator.free(json_data);
                 const report = reports.mtasts.parseJson(allocator, json_data) catch continue;
+                defer report.deinit(allocator);
                 st.saveTlsReport(&report) catch continue;
+                tls_saved = true;
             }
-            st.markUidFetched(uid);
-            fetched_set.put(uid, {}) catch {};
+            if (tls_saved) {
+                st.markUidFetched(uid);
+                fetched_set.put(uid, {}) catch {};
+            }
         }
     }
 
