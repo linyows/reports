@@ -96,7 +96,7 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
 }
 
 fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8) struct { dmarc: u32, tls: u32 } {
-    const client = reports.imap.Client.init(
+    var client = reports.imap.Client.init(
         allocator,
         acct.host,
         acct.port,
@@ -105,8 +105,18 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
         acct.mailbox,
         acct.tls,
     );
+    client.connect() catch |err| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "IMAP connect failed: {s}\n", .{@errorName(err)}) catch "IMAP connect failed\n";
+        stderr_file.writeAll(msg) catch {};
+        return .{ .dmarc = 0, .tls = 0 };
+    };
+    defer client.deinit();
 
     const st = Store.init(allocator, data_dir, acct.name);
+
+    var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
+    defer fetched_set.deinit();
 
     // DMARC
     stdout_file.writeAll("Searching for DMARC reports...\n") catch {};
@@ -118,17 +128,25 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     };
     defer allocator.free(dmarc_uids);
 
+    var dmarc_new: usize = 0;
+    for (dmarc_uids) |uid| {
+        if (!fetched_set.contains(uid)) dmarc_new += 1;
+    }
+
     {
-        var buf: [64]u8 = undefined;
-        const found_msg = std.fmt.bufPrint(&buf, "Found {d} DMARC messages. Fetching...\n", .{dmarc_uids.len}) catch "Fetching...\n";
+        var buf: [128]u8 = undefined;
+        const found_msg = std.fmt.bufPrint(&buf, "Found {d} DMARC messages ({d} new). Fetching...\n", .{ dmarc_uids.len, dmarc_new }) catch "Fetching...\n";
         stdout_file.writeAll(found_msg) catch {};
     }
 
     var dmarc_count: u32 = 0;
-    for (dmarc_uids, 0..) |uid, idx| {
+    var dmarc_progress: usize = 0;
+    for (dmarc_uids) |uid| {
+        if (fetched_set.contains(uid)) continue;
+        dmarc_progress += 1;
         {
             var pbuf: [64]u8 = undefined;
-            const progress = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ idx + 1, dmarc_uids.len }) catch "";
+            const progress = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ dmarc_progress, dmarc_new }) catch "";
             stderr_file.writeAll(progress) catch {};
         }
         const raw = client.fetchMessage(uid) catch continue;
@@ -152,8 +170,10 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
             st.saveDmarcReport(&report) catch continue;
             dmarc_count += 1;
         }
+        st.markUidFetched(uid);
+        fetched_set.put(uid, {}) catch {};
     }
-    stderr_file.writeAll("\n") catch {};
+    if (dmarc_new > 0) stderr_file.writeAll("\n") catch {};
 
     // TLS-RPT
     stdout_file.writeAll("Searching for TLS-RPT reports...\n") catch {};
@@ -165,8 +185,27 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     };
     defer allocator.free(tls_uids);
 
-    var tls_count: u32 = 0;
+    var tls_new: usize = 0;
     for (tls_uids) |uid| {
+        if (!fetched_set.contains(uid)) tls_new += 1;
+    }
+
+    {
+        var buf: [128]u8 = undefined;
+        const found_msg = std.fmt.bufPrint(&buf, "Found {d} TLS-RPT messages ({d} new). Fetching...\n", .{ tls_uids.len, tls_new }) catch "Fetching...\n";
+        stdout_file.writeAll(found_msg) catch {};
+    }
+
+    var tls_count: u32 = 0;
+    var tls_progress: usize = 0;
+    for (tls_uids) |uid| {
+        if (fetched_set.contains(uid)) continue;
+        tls_progress += 1;
+        {
+            var pbuf: [64]u8 = undefined;
+            const progress = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ tls_progress, tls_new }) catch "";
+            stderr_file.writeAll(progress) catch {};
+        }
         const raw = client.fetchMessage(uid) catch continue;
         defer allocator.free(raw);
 
@@ -188,7 +227,10 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
             st.saveTlsReport(&report) catch continue;
             tls_count += 1;
         }
+        st.markUidFetched(uid);
+        fetched_set.put(uid, {}) catch {};
     }
+    if (tls_new > 0) stderr_file.writeAll("\n") catch {};
 
     return .{ .dmarc = dmarc_count, .tls = tls_count };
 }

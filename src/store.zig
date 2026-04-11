@@ -68,6 +68,42 @@ pub const Store = struct {
         try file.writeAll(json);
     }
 
+    pub fn loadFetchedUids(self: *const Store) !std.AutoHashMap(u32, void) {
+        var set = std.AutoHashMap(u32, void).init(self.allocator);
+
+        const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, ".fetched_uids" });
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch return set;
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1 * 1024 * 1024) catch return set;
+        defer self.allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \r");
+            if (trimmed.len == 0) continue;
+            const uid = std.fmt.parseInt(u32, trimmed, 10) catch continue;
+            set.put(uid, {}) catch continue;
+        }
+
+        return set;
+    }
+
+    pub fn markUidFetched(self: *const Store, uid: u32) void {
+        const path = std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, ".fetched_uids" }) catch return;
+        defer self.allocator.free(path);
+
+        const file = std.fs.createFileAbsolute(path, .{ .truncate = false }) catch return;
+        defer file.close();
+        file.seekFromEnd(0) catch {};
+
+        var buf: [16]u8 = undefined;
+        const uid_str = std.fmt.bufPrint(&buf, "{d}\n", .{uid}) catch return;
+        file.writeAll(uid_str) catch {};
+    }
+
     pub fn listReports(self: *const Store) ![]ReportEntry {
         var entries: std.ArrayList(ReportEntry) = .empty;
 

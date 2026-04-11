@@ -23,7 +23,7 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
     for (cfg.accounts) |acct| {
         if (acct.host.len == 0) continue;
 
-        const client = reports.imap.Client.init(
+        var client = reports.imap.Client.init(
             allocator,
             acct.host,
             acct.port,
@@ -32,14 +32,20 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
             acct.mailbox,
             acct.tls,
         );
+        client.connect() catch continue;
+        defer client.deinit();
 
         const st = reports.store.Store.init(allocator, cfg.data_dir, acct.name);
+
+        var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
+        defer fetched_set.deinit();
 
         // DMARC
         const dmarc_uids = client.searchDmarcReports() catch continue;
         defer allocator.free(dmarc_uids);
 
         for (dmarc_uids) |uid| {
+            if (fetched_set.contains(uid)) continue;
             const raw = client.fetchMessage(uid) catch continue;
             defer allocator.free(raw);
 
@@ -59,6 +65,8 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
                 const report = reports.dmarc.parseXml(allocator, xml_data) catch continue;
                 st.saveDmarcReport(&report) catch continue;
             }
+            st.markUidFetched(uid);
+            fetched_set.put(uid, {}) catch {};
         }
 
         // TLS-RPT
@@ -66,6 +74,7 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
         defer allocator.free(tls_uids);
 
         for (tls_uids) |uid| {
+            if (fetched_set.contains(uid)) continue;
             const raw = client.fetchMessage(uid) catch continue;
             defer allocator.free(raw);
 
@@ -85,6 +94,8 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
                 const report = reports.mtasts.parseJson(allocator, json_data) catch continue;
                 st.saveTlsReport(&report) catch continue;
             }
+            st.markUidFetched(uid);
+            fetched_set.put(uid, {}) catch {};
         }
     }
 
