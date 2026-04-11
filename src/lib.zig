@@ -120,8 +120,8 @@ export fn reports_list(config_json: [*:0]const u8) ?[*:0]u8 {
             .dmarc => "dmarc",
             .tlsrpt => "tlsrpt",
         };
-        const json_entry = std.fmt.allocPrint(allocator, "{{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\"}}", .{
-            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain,
+        const json_entry = std.fmt.allocPrint(allocator, "{{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\"}}", .{
+            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain, e.policy,
         }) catch return null;
         defer allocator.free(json_entry);
         buf.appendSlice(allocator, json_entry) catch return null;

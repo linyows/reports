@@ -16,6 +16,7 @@ pub const ReportEntry = struct {
     date_begin: []const u8,
     date_end: []const u8,
     domain: []const u8,
+    policy: []const u8,
     filename: []const u8,
 };
 
@@ -219,6 +220,7 @@ pub fn freeReportEntries(allocator: Allocator, entries: []const ReportEntry) voi
         allocator.free(e.date_begin);
         allocator.free(e.date_end);
         allocator.free(e.domain);
+        allocator.free(e.policy);
         allocator.free(e.filename);
     }
     allocator.free(entries);
@@ -247,6 +249,7 @@ fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: Repor
                 .date_begin = try formatTimestamp(allocator, j.metadata.date_begin),
                 .date_end = try formatTimestamp(allocator, j.metadata.date_end),
                 .domain = try allocator.dupe(u8, j.policy.domain),
+                .policy = try allocator.dupe(u8, j.policy.policy),
                 .filename = try allocator.dupe(u8, filename),
             };
         },
@@ -263,6 +266,7 @@ fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: Repor
                 .date_begin = try allocator.dupe(u8, j.start_datetime),
                 .date_end = try allocator.dupe(u8, j.end_datetime),
                 .domain = try allocator.dupe(u8, if (j.policies.len > 0) j.policies[0].policy_domain else ""),
+                .policy = try allocator.dupe(u8, if (j.policies.len > 0) j.policies[0].policy_type else ""),
                 .filename = try allocator.dupe(u8, filename),
             };
         },
@@ -278,6 +282,7 @@ const DmarcJson = struct {
     },
     policy: struct {
         domain: []const u8 = "",
+        policy: []const u8 = "",
     },
 };
 
@@ -288,6 +293,7 @@ const TlsJson = struct {
     end_datetime: []const u8 = "",
     policies: []const struct {
         policy_domain: []const u8 = "",
+        policy_type: []const u8 = "",
     } = &.{},
 };
 
@@ -336,6 +342,7 @@ test "parseEntryFromJson parses dmarc entry with account" {
         allocator.free(entry.date_begin);
         allocator.free(entry.date_end);
         allocator.free(entry.domain);
+        allocator.free(entry.policy);
         allocator.free(entry.filename);
     }
 

@@ -629,13 +629,13 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
     _ = allocator;
     var buf: [512]u8 = undefined;
 
-    const header = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<30} {s:<17} {s:<20}\n", .{
-        "ACCOUNT", "TYPE", "ORGANIZATION", "REPORT ID", "DATE", "DOMAIN",
+    const header = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<30} {s:<17} {s:<20} {s:<10}\n", .{
+        "ACCOUNT", "TYPE", "ORGANIZATION", "REPORT ID", "DATE", "DOMAIN", "POLICY",
     }) catch return;
     stdout_file.writeAll(header) catch {};
 
-    const sep = std.fmt.bufPrint(&buf, "{s:-<10} {s:-<8} {s:-<20} {s:-<30} {s:-<17} {s:-<20}\n", .{
-        "", "", "", "", "", "",
+    const sep = std.fmt.bufPrint(&buf, "{s:-<10} {s:-<8} {s:-<20} {s:-<30} {s:-<17} {s:-<20} {s:-<10}\n", .{
+        "", "", "", "", "", "", "",
     }) catch return;
     stdout_file.writeAll(sep) catch {};
 
@@ -644,13 +644,14 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
             .dmarc => "DMARC",
             .tlsrpt => "TLS-RPT",
         };
-        const line = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<30} {s:<17} {s:<20}\n", .{
+        const line = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<30} {s:<17} {s:<20} {s:<10}\n", .{
             truncate(e.account_name, 9),
             type_str,
             truncate(e.org_name, 19),
             truncate(e.report_id, 29),
             truncate(e.date_begin, 16),
             truncate(e.domain, 19),
+            truncate(e.policy, 9),
         }) catch continue;
         stdout_file.writeAll(line) catch {};
     }
@@ -664,8 +665,8 @@ fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.Re
             .dmarc => "dmarc",
             .tlsrpt => "tlsrpt",
         };
-        const json_entry = try std.fmt.allocPrint(allocator, "\n  {{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\"}}", .{
-            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain,
+        const json_entry = try std.fmt.allocPrint(allocator, "\n  {{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\"}}", .{
+            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain, e.policy,
         });
         defer allocator.free(json_entry);
         stdout_file.writeAll(json_entry) catch {};
