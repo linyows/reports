@@ -27,6 +27,28 @@ pub const Report = struct {
         failure_reason_code: []const u8,
     };
 
+    pub fn deinit(self: *const Report, allocator: Allocator) void {
+        allocator.free(self.organization_name);
+        allocator.free(self.start_datetime);
+        allocator.free(self.end_datetime);
+        allocator.free(self.contact_info);
+        allocator.free(self.report_id);
+        for (self.policies) |p| {
+            allocator.free(p.policy_type);
+            allocator.free(p.policy_domain);
+            allocator.free(p.mx_host);
+            for (p.failures) |f| {
+                allocator.free(f.result_type);
+                allocator.free(f.sending_mta_ip);
+                allocator.free(f.receiving_mx_hostname);
+                allocator.free(f.receiving_ip);
+                allocator.free(f.failure_reason_code);
+            }
+            allocator.free(p.failures);
+        }
+        allocator.free(self.policies);
+    }
+
     pub fn toJson(self: *const Report, allocator: Allocator) ![]const u8 {
         return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(self.*, .{})});
     }
@@ -47,7 +69,7 @@ const JsonPolicy = struct {
     policy: ?struct {
         @"policy-type": []const u8 = "",
         @"policy-domain": []const u8 = "",
-        @"mx-host": []const u8 = "",
+        @"mx-host": ?std.json.Value = null,
     } = null,
     summary: ?struct {
         @"total-successful-session-count": u64 = 0,
@@ -91,7 +113,14 @@ pub fn parseJson(allocator: Allocator, data: []const u8) !Report {
 
             const policy_type = if (p.policy) |pp| pp.@"policy-type" else "";
             const policy_domain = if (p.policy) |pp| pp.@"policy-domain" else "";
-            const mx_host = if (p.policy) |pp| pp.@"mx-host" else "";
+            const mx_host: []const u8 = if (p.policy) |pp| blk: {
+                const v = pp.@"mx-host" orelse break :blk "";
+                switch (v) {
+                    .string => |s| break :blk s,
+                    .array => |a| break :blk if (a.items.len > 0 and a.items[0] == .string) a.items[0].string else "",
+                    else => break :blk "",
+                }
+            } else "";
             const total_successful = if (p.summary) |ss| ss.@"total-successful-session-count" else 0;
             const total_failure = if (p.summary) |ss| ss.@"total-failure-session-count" else 0;
 
@@ -121,27 +150,6 @@ pub fn parseJson(allocator: Allocator, data: []const u8) !Report {
 
 // --- Tests ---
 
-fn freeReport(allocator: Allocator, r: Report) void {
-    allocator.free(r.organization_name);
-    allocator.free(r.start_datetime);
-    allocator.free(r.end_datetime);
-    allocator.free(r.contact_info);
-    allocator.free(r.report_id);
-    for (r.policies) |p| {
-        allocator.free(p.policy_type);
-        allocator.free(p.policy_domain);
-        allocator.free(p.mx_host);
-        for (p.failures) |f| {
-            allocator.free(f.result_type);
-            allocator.free(f.sending_mta_ip);
-            allocator.free(f.receiving_mx_hostname);
-            allocator.free(f.receiving_ip);
-            allocator.free(f.failure_reason_code);
-        }
-        allocator.free(p.failures);
-    }
-    allocator.free(r.policies);
-}
 
 test "parse tlsrpt json with policy and failures" {
     const allocator = std.testing.allocator;
@@ -167,7 +175,7 @@ test "parse tlsrpt json with policy and failures" {
     ;
 
     const report = try parseJson(allocator, json_data);
-    defer freeReport(allocator, report);
+    defer report.deinit(allocator);
 
     try std.testing.expectEqualStrings("example.com", report.organization_name);
     try std.testing.expectEqualStrings("rpt-001", report.report_id);
@@ -185,6 +193,37 @@ test "parse tlsrpt json with policy and failures" {
     try std.testing.expectEqual(@as(u64, 2), report.policies[0].failures[0].failed_session_count);
 }
 
+test "parse tlsrpt json with mx-host as array" {
+    const allocator = std.testing.allocator;
+    const json_data =
+        \\{
+        \\  "organization-name": "Google Inc.",
+        \\  "date-range": { "start-datetime": "2026-04-07T00:00:00Z", "end-datetime": "2026-04-07T23:59:59Z" },
+        \\  "contact-info": "smtp-tls-reporting@google.com",
+        \\  "report-id": "2026-04-07T00:00:00Z_example.com",
+        \\  "policies": [{
+        \\    "policy": {
+        \\      "policy-type": "sts",
+        \\      "policy-string": ["version: STSv1", "mode: testing", "mx: mx.example.com", "max_age: 86400"],
+        \\      "policy-domain": "example.com",
+        \\      "mx-host": ["mx.example.com"]
+        \\    },
+        \\    "summary": { "total-successful-session-count": 1, "total-failure-session-count": 0 }
+        \\  }]
+        \\}
+    ;
+
+    const report = try parseJson(allocator, json_data);
+    defer report.deinit(allocator);
+
+    try std.testing.expectEqualStrings("Google Inc.", report.organization_name);
+    try std.testing.expectEqual(@as(usize, 1), report.policies.len);
+    try std.testing.expectEqualStrings("sts", report.policies[0].policy_type);
+    try std.testing.expectEqualStrings("example.com", report.policies[0].policy_domain);
+    try std.testing.expectEqualStrings("mx.example.com", report.policies[0].mx_host);
+    try std.testing.expectEqual(@as(u64, 1), report.policies[0].total_successful);
+}
+
 test "parse tlsrpt json without optional fields" {
     const allocator = std.testing.allocator;
     const json_data =
@@ -196,7 +235,7 @@ test "parse tlsrpt json without optional fields" {
     ;
 
     const report = try parseJson(allocator, json_data);
-    defer freeReport(allocator, report);
+    defer report.deinit(allocator);
 
     try std.testing.expectEqualStrings("minimal.org", report.organization_name);
     try std.testing.expectEqualStrings("rpt-min", report.report_id);
