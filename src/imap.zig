@@ -13,6 +13,7 @@ pub const Client = struct {
     password: []const u8,
     mailbox: []const u8,
     tls: bool,
+    handle: ?*anyopaque = null,
 
     pub fn init(allocator: Allocator, host: []const u8, port: u16, username: []const u8, password: []const u8, mailbox: []const u8, tls: bool) Client {
         return .{
@@ -24,6 +25,34 @@ pub const Client = struct {
             .mailbox = mailbox,
             .tls = tls,
         };
+    }
+
+    pub fn connect(self: *Client) !void {
+        const h = c.curl_easy_init() orelse return error.CurlInitFailed;
+
+        const username_z = try self.allocator.dupeZ(u8, self.username);
+        defer self.allocator.free(username_z);
+        _ = c.curl_easy_setopt(h, c.CURLOPT_USERNAME, username_z.ptr);
+
+        const password_z = try self.allocator.dupeZ(u8, self.password);
+        defer self.allocator.free(password_z);
+        _ = c.curl_easy_setopt(h, c.CURLOPT_PASSWORD, password_z.ptr);
+
+        if (self.tls) {
+            _ = c.curl_easy_setopt(h, c.CURLOPT_USE_SSL, @as(c_long, c.CURLUSESSL_ALL));
+        }
+
+        _ = c.curl_easy_setopt(h, c.CURLOPT_TIMEOUT, @as(c_long, 120));
+        _ = c.curl_easy_setopt(h, c.CURLOPT_CONNECTTIMEOUT, @as(c_long, 15));
+
+        self.handle = h;
+    }
+
+    pub fn deinit(self: *Client) void {
+        if (self.handle) |h| {
+            c.curl_easy_cleanup(h);
+            self.handle = null;
+        }
     }
 
     pub fn searchDmarcReports(self: *const Client) ![]u32 {
@@ -60,34 +89,45 @@ pub const Client = struct {
     }
 
     fn perform(self: *const Client, url: [*:0]const u8, custom_request: ?[*:0]const u8) ![]const u8 {
-        const handle = c.curl_easy_init() orelse return error.CurlInitFailed;
-        defer c.curl_easy_cleanup(handle);
+        if (self.handle) |h| {
+            return self.doPerform(h, url, custom_request, false);
+        } else {
+            const h = c.curl_easy_init() orelse return error.CurlInitFailed;
+            defer c.curl_easy_cleanup(h);
+            return self.doPerform(h, url, custom_request, true);
+        }
+    }
 
+    fn doPerform(self: *const Client, handle: *anyopaque, url: [*:0]const u8, custom_request: ?[*:0]const u8, set_auth: bool) ![]const u8 {
         var response = WriteData{ .allocator = self.allocator };
 
         _ = c.curl_easy_setopt(handle, c.CURLOPT_URL, url);
 
-        const username_z = try self.allocator.dupeZ(u8, self.username);
-        defer self.allocator.free(username_z);
-        _ = c.curl_easy_setopt(handle, c.CURLOPT_USERNAME, username_z.ptr);
+        if (set_auth) {
+            const username_z = try self.allocator.dupeZ(u8, self.username);
+            defer self.allocator.free(username_z);
+            _ = c.curl_easy_setopt(handle, c.CURLOPT_USERNAME, username_z.ptr);
 
-        const password_z = try self.allocator.dupeZ(u8, self.password);
-        defer self.allocator.free(password_z);
-        _ = c.curl_easy_setopt(handle, c.CURLOPT_PASSWORD, password_z.ptr);
+            const password_z = try self.allocator.dupeZ(u8, self.password);
+            defer self.allocator.free(password_z);
+            _ = c.curl_easy_setopt(handle, c.CURLOPT_PASSWORD, password_z.ptr);
+
+            if (self.tls) {
+                _ = c.curl_easy_setopt(handle, c.CURLOPT_USE_SSL, @as(c_long, c.CURLUSESSL_ALL));
+            }
+
+            _ = c.curl_easy_setopt(handle, c.CURLOPT_TIMEOUT, @as(c_long, 120));
+            _ = c.curl_easy_setopt(handle, c.CURLOPT_CONNECTTIMEOUT, @as(c_long, 15));
+        }
 
         if (custom_request) |req| {
             _ = c.curl_easy_setopt(handle, c.CURLOPT_CUSTOMREQUEST, req);
+        } else {
+            _ = c.curl_easy_setopt(handle, c.CURLOPT_CUSTOMREQUEST, @as([*c]const u8, null));
         }
 
         _ = c.curl_easy_setopt(handle, c.CURLOPT_WRITEFUNCTION, &writeCallback);
         _ = c.curl_easy_setopt(handle, c.CURLOPT_WRITEDATA, &response);
-
-        if (self.tls) {
-            _ = c.curl_easy_setopt(handle, c.CURLOPT_USE_SSL, @as(c_long, c.CURLUSESSL_ALL));
-        }
-
-        _ = c.curl_easy_setopt(handle, c.CURLOPT_TIMEOUT, @as(c_long, 120));
-        _ = c.curl_easy_setopt(handle, c.CURLOPT_CONNECTTIMEOUT, @as(c_long, 15));
 
         const result = c.curl_easy_perform(handle);
         if (result != c.CURLE_OK) {
