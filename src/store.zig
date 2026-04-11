@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const zlug = @import("zlug");
 const dmarc = @import("dmarc.zig");
 const mtasts = @import("mtasts.zig");
 
@@ -33,7 +34,7 @@ pub const Store = struct {
         const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "dmarc" });
         defer self.allocator.free(dir);
 
-        const slug = try slugify(self.allocator, report.metadata.org_name);
+        const slug = try zlug.slugifyAlloc(self.allocator, report.metadata.org_name, .{});
         defer self.allocator.free(slug);
         const filename = try std.fmt.allocPrint(self.allocator, "{s}_{s}.json", .{
             slug, report.metadata.report_id,
@@ -55,7 +56,7 @@ pub const Store = struct {
         const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "tlsrpt" });
         defer self.allocator.free(dir);
 
-        const slug = try slugify(self.allocator, report.organization_name);
+        const slug = try zlug.slugifyAlloc(self.allocator, report.organization_name, .{});
         defer self.allocator.free(slug);
         const filename = try std.fmt.allocPrint(self.allocator, "{s}_{s}.json", .{
             slug, report.report_id,
@@ -301,31 +302,6 @@ const TlsJson = struct {
     } = &.{},
 };
 
-fn slugify(allocator: Allocator, input: []const u8) ![]u8 {
-    var result: std.ArrayList(u8) = .empty;
-    var prev_hyphen = false;
-    for (input) |ch| {
-        if (std.ascii.isAlphanumeric(ch)) {
-            try result.append(allocator, std.ascii.toLower(ch));
-            prev_hyphen = false;
-        } else if (ch == '.' or ch == '_') {
-            try result.append(allocator, ch);
-            prev_hyphen = false;
-        } else if (ch == ' ' or ch == '-' or ch == '/' or ch == '@') {
-            if (!prev_hyphen and result.items.len > 0) {
-                try result.append(allocator, '-');
-                prev_hyphen = true;
-            }
-        }
-        // Other characters (multibyte, special chars) are dropped
-    }
-    // Trim trailing hyphen
-    while (result.items.len > 0 and result.items[result.items.len - 1] == '-') {
-        result.items.len -= 1;
-    }
-    return result.toOwnedSlice(allocator);
-}
-
 fn formatTimestamp(allocator: Allocator, ts: i64) ![]const u8 {
     if (ts == 0) return try allocator.dupe(u8, "");
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
@@ -344,39 +320,20 @@ fn formatTimestamp(allocator: Allocator, ts: i64) ![]const u8 {
 
 // --- Tests ---
 
-test "slugify ascii domain" {
+test "slugify org_name for filename" {
     const allocator = std.testing.allocator;
-    const s = try slugify(allocator, "google.com");
-    defer allocator.free(s);
-    try std.testing.expectEqualStrings("google.com", s);
-}
 
-test "slugify with spaces and caps" {
-    const allocator = std.testing.allocator;
-    const s = try slugify(allocator, "Google Inc.");
-    defer allocator.free(s);
-    try std.testing.expectEqualStrings("google-inc.", s);
-}
+    const s1 = try zlug.slugifyAlloc(allocator, "google.com", .{});
+    defer allocator.free(s1);
+    try std.testing.expectEqualStrings("google-com", s1);
 
-test "slugify strips multibyte and special chars" {
-    const allocator = std.testing.allocator;
-    const s = try slugify(allocator, "日本語テスト Corp.");
-    defer allocator.free(s);
-    try std.testing.expectEqualStrings("corp.", s);
-}
+    const s2 = try zlug.slugifyAlloc(allocator, "Google Inc.", .{});
+    defer allocator.free(s2);
+    try std.testing.expectEqualStrings("google-inc", s2);
 
-test "slugify collapses hyphens" {
-    const allocator = std.testing.allocator;
-    const s = try slugify(allocator, "a  - b");
-    defer allocator.free(s);
-    try std.testing.expectEqualStrings("a-b", s);
-}
-
-test "slugify email-like report id" {
-    const allocator = std.testing.allocator;
-    const s = try slugify(allocator, "<2026.04.09T00.00.00Z+one.sakura.ad.jp@google.com>");
-    defer allocator.free(s);
-    try std.testing.expectEqualStrings("2026.04.09t00.00.00z-one.sakura.ad.jp-google.com", s);
+    const s3 = try zlug.slugifyAlloc(allocator, "日本語テスト Corp.", .{});
+    defer allocator.free(s3);
+    try std.testing.expectEqualStrings("ri-ben-yu-tesuto-corp", s3);
 }
 
 test "formatTimestamp formats correctly" {
