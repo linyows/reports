@@ -26,11 +26,14 @@ pub fn extractAttachments(allocator: Allocator, raw: []const u8) ![]Attachment {
         return try attachments.toOwnedSlice(allocator);
     };
 
-    var parts = std.mem.splitSequence(u8, raw, boundary);
+    var delim_buf: [256]u8 = undefined;
+    const delim = std.fmt.bufPrint(&delim_buf, "--{s}", .{boundary}) catch boundary;
+    var parts = std.mem.splitSequence(u8, raw, delim);
     _ = parts.next(); // preamble
 
-    while (parts.next()) |part| {
-        if (std.mem.startsWith(u8, std.mem.trimLeft(u8, part, "-"), "\r\n")) continue;
+    while (parts.next()) |part_raw| {
+        const part = std.mem.trimLeft(u8, part_raw, "\r\n");
+        if (part.len == 0 or std.mem.startsWith(u8, part, "--")) continue;
 
         const ct = findHeaderValue(part, "Content-Type") orelse "";
         const cte = findHeaderValue(part, "Content-Transfer-Encoding");
@@ -400,6 +403,72 @@ test "extractAttachments from single-part email" {
     try std.testing.expectEqualStrings("<?xml version=\"1.0\"?>", attachments[0].data);
 }
 
+test "extractAttachments from multipart/report with --boundary" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "Content-Type: multipart/report; boundary=\"abc123\"; report-type=tlsrpt\r\n" ++
+        "\r\n" ++
+        "--abc123\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "\r\n" ++
+        "This is a TLS report.\r\n" ++
+        "--abc123\r\n" ++
+        "Content-Type: application/tlsrpt+json\r\n" ++
+        "\r\n" ++
+        "{\"report\": true}\r\n" ++
+        "--abc123--\r\n";
+
+    const attachments = try extractAttachments(allocator, raw);
+    defer {
+        for (attachments) |att| {
+            allocator.free(att.filename);
+            allocator.free(att.content_type);
+            allocator.free(att.data);
+        }
+        allocator.free(attachments);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), attachments.len);
+    try std.testing.expectEqualStrings("application/tlsrpt+json", attachments[0].content_type);
+    try std.testing.expectEqualStrings("{\"report\": true}", attachments[0].data);
+}
+
+test "extractAttachments from multipart/report with gzip content-type" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "Content-Type: multipart/report; boundary=\"bnd\"; report-type=tlsrpt\r\n" ++
+        "\r\n" ++
+        "--bnd\r\n" ++
+        "Content-Type: application/tlsrpt+gzip; name=\"report.gz\"\r\n" ++
+        "Content-Transfer-Encoding: base64\r\n" ++
+        "Content-Disposition: attachment; filename=\"report.gz\"\r\n" ++
+        "\r\n" ++
+        "H4sIAAAAAAAAA6tWKkktLlGyUlAqS8wpTtVRSs7PS8nMS1eqBQBIXVQdGgAAAA==\r\n" ++
+        "--bnd--\r\n";
+
+    const attachments = try extractAttachments(allocator, raw);
+    defer {
+        for (attachments) |att| {
+            allocator.free(att.filename);
+            allocator.free(att.content_type);
+            allocator.free(att.data);
+        }
+        allocator.free(attachments);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), attachments.len);
+    try std.testing.expectEqualStrings("report.gz", attachments[0].filename);
+}
+
+test "decodeBody base64 ignores non-base64 characters" {
+    const allocator = std.testing.allocator;
+    // "hello" in base64 is "aGVsbG8=" with trailing junk
+    const body = "aGVsbG8=\r\n--boundary\r\n";
+    const decoded = try decodeBody(allocator, body, "base64");
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
+}
+
 fn decodeBody(allocator: Allocator, body: []const u8, encoding: ?[]const u8) ![]const u8 {
     const enc = encoding orelse return try allocator.dupe(u8, std.mem.trim(u8, body, " \t\r\n"));
 
@@ -407,7 +476,7 @@ fn decodeBody(allocator: Allocator, body: []const u8, encoding: ?[]const u8) ![]
         var clean: std.ArrayList(u8) = .empty;
         defer clean.deinit(allocator);
         for (body) |ch| {
-            if (ch != '\r' and ch != '\n' and ch != ' ' and ch != '\t') {
+            if (std.mem.indexOfScalar(u8, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=", ch) != null) {
                 try clean.append(allocator, ch);
             }
         }
