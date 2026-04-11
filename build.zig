@@ -8,11 +8,19 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "version", build_zon.version);
 
+    const zlug = b.dependency("zlug", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zlug");
+
     // Core library module
     const mod = b.addModule("reports", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "zlug", .module = zlug },
+        },
     });
     // libxml2 headers are in a subdirectory on most systems
     for ([_][]const u8{

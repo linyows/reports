@@ -1,9 +1,9 @@
-<p align="right">English | <a href="https://github.com/linyows/reports/blob/main/README.ja.md">日本語</a></p>
+<p align="right"><a href="https://github.com/linyows/reports/blob/main/README.md">English</a> | 日本語</p>
 
 <p align="center">
   <img src="https://github.com/linyows/reports/blob/main/misc/reports.svg?raw=true" alt="REPORTS" />
   <br><br>
-  DMARC and MTA-STS report viewer
+  DMARC / MTA-STS レポートビューア
 </p>
 
 <p align="center">
@@ -15,7 +15,17 @@
   </a>
 </p>
 
-## Architecture
+## 特徴
+
+- IMAP経由でDMARC集約レポート (RFC 7489) とTLS-RPTレポート (RFC 8460) を取得
+- 複数IMAPアカウント対応（アカウントごとに分離保存）
+- XML/JSON形式のレポートをZIP/GZIP解凍してパース
+- レポートの一覧、詳細表示、サマリー統計（テーブル/JSON出力）
+- アカウント・ドメイン・期間によるフィルタリング
+- 差分取得による高速な再実行（取得済みメッセージをスキップ）
+- C ABIスタティックライブラリによるネイティブUI連携
+
+## アーキテクチャ
 
 ```mermaid
 graph TD
@@ -48,21 +58,11 @@ graph TD
     CLI --> Swift[SwiftUI macOS<br>via libreports-core.a]
 ```
 
-## Features
+## インストール
 
-- Fetch DMARC aggregate reports (RFC 7489) and TLS-RPT reports (RFC 8460) from IMAP
-- Multiple IMAP account support with per-account storage
-- Parse XML/JSON report formats with ZIP/GZIP decompression
-- List, show, and summarize reports with table or JSON output
-- Filter by account, domain, and time period (week/month/year)
-- Incremental fetch with UID tracking (skips already-fetched messages)
-- Headless core with C ABI static library for native UI integration
+### ソースからビルド
 
-## Installation
-
-### Build from source
-
-Requires Zig 0.15.2 or later.
+Zig 0.15.2以降が必要です。
 
 ```bash
 $ git clone https://github.com/linyows/reports.git
@@ -70,25 +70,25 @@ $ cd reports
 $ zig build --release=fast
 ```
 
-The binary will be available at `./zig-out/bin/reports`.
+バイナリは `./zig-out/bin/reports` に生成されます。
 
-### Dependencies
+### 依存ライブラリ
 
-- **libxml2** - DMARC XML parsing
-- **libcurl** - IMAP connectivity
-- **zlib** - gzip/zip decompression
+- **libxml2** - DMARC XMLパース
+- **libcurl** - IMAP接続
+- **zlib** - gzip/zip解凍
 
-On macOS, these are included in the SDK. On Linux:
+macOSではSDKに含まれています。Linuxの場合:
 
 ```bash
 $ sudo apt-get install libxml2-dev libcurl4-openssl-dev zlib1g-dev
 ```
 
-## Usage
+## 使い方
 
-### Configure
+### 設定
 
-Create `~/.config/reports/config.json`:
+`~/.config/reports/config.json` を作成:
 
 ```json
 {
@@ -106,32 +106,31 @@ Create `~/.config/reports/config.json`:
 }
 ```
 
-For Gmail, generate an [App Password](https://myaccount.google.com/apppasswords). Set `mailbox` to the label name if reports are filtered (e.g., `"dmarc"`).
+Gmailの場合は[アプリパスワード](https://myaccount.google.com/apppasswords)を生成してください。レポートをフィルタリングしている場合は `mailbox` にラベル名を指定します（例: `"dmarc"`）。
 
-Legacy single-account format (`"imap": {...}`) is also supported and treated as a `"default"` account.
-
-### Fetch reports
+### レポートの取得
 
 ```bash
 $ reports fetch
 $ reports fetch --account personal
 ```
 
-### List reports
+2回目以降は取得済みメッセージをスキップし、新着のみを取得します。
+
+### レポート一覧
 
 ```bash
 $ reports list
-ACCOUNT    TYPE     ORGANIZATION         REPORT ID                      DATE              DOMAIN
----------- -------- -------------------- ------------------------------ ----------------- --------------------
-personal   DMARC    google.com           12864733003343132926           2026-04-02 00:00  example.com
-personal   DMARC    google.com           3504435274969495050            2026-04-01 00:00  example.com
+ACCOUNT    TYPE     ORGANIZATION         REPORT ID                      DATE              DOMAIN               POLICY
+---------- -------- -------------------- ------------------------------ ----------------- -------------------- ----------
+personal   DMARC    google.com           12864733003343132926           2026-04-02 00:00  example.com          none
 ...
 
 $ reports list --account personal --domain example.com
 $ reports list --format json
 ```
 
-### Show report details
+### レポート詳細
 
 ```bash
 $ reports show 12864733003343132926
@@ -147,7 +146,7 @@ SOURCE IP        COUNT  DISPOSITION  ENVELOPE FROM             HEADER FROM      
 $ reports show 12864733003343132926 --format json
 ```
 
-### Summary statistics
+### サマリー統計
 
 ```bash
 $ reports summary --format table
@@ -158,19 +157,30 @@ DKIM/SPF Pass:    182
 DKIM/SPF Fail:    365
 
 $ reports summary --period month --format table
+PERIOD        DMARC  TLS-RPT   MESSAGES     PASS     FAIL
+------------ ------ -------- ---------- -------- --------
+2026-04          37        0         96       58       38
+2025-12          12        0         30       20       10
+...
+
 $ reports summary --account personal --domain example.com --format json
 ```
 
-### List domains
+`--period` オプションで `week`、`month`、`year` ごとにグループ化できます。
+
+### ドメイン一覧
 
 ```bash
 $ reports domains
+example.com
+example.org
+
 $ reports domains --format json
 ```
 
-## C ABI / SwiftUI Integration
+## C ABI / SwiftUI連携
 
-The build produces a static library and C header for native app integration:
+ビルドするとスタティックライブラリとCヘッダーが生成されます:
 
 ```bash
 $ zig build
@@ -183,24 +193,24 @@ $ ls zig-out/include/reports.h
 
 reports_init();
 char *json = reports_list(config_json);
-// use json...
+// jsonを使用...
 reports_free_string(json);
 reports_deinit();
 ```
 
-## Development
+## 開発
 
 ```bash
-# Build
+# ビルド
 zig build
 
-# Run tests
+# テスト実行
 zig build test
 
-# Format check
+# フォーマットチェック
 zig fmt --check src/
 
-# Run
+# 実行
 zig build run -- help
 ```
 
