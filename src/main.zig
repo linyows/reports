@@ -1,5 +1,6 @@
 const std = @import("std");
 const reports = @import("reports");
+const build_options = @import("build_options");
 
 const Config = reports.config.Config;
 const Store = reports.store.Store;
@@ -49,6 +50,8 @@ pub fn main() !void {
         try cmdSummary(allocator, format orelse "json", domain, account, period);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage();
+    } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
+        printVersion();
     } else {
         stderr_file.writeAll("Unknown command: ") catch {};
         stderr_file.writeAll(command) catch {};
@@ -96,7 +99,7 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
 }
 
 fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8) struct { dmarc: u32, tls: u32 } {
-    const client = reports.imap.Client.init(
+    var client = reports.imap.Client.init(
         allocator,
         acct.host,
         acct.port,
@@ -105,8 +108,18 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
         acct.mailbox,
         acct.tls,
     );
+    client.connect() catch |err| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "IMAP connect failed: {s}\n", .{@errorName(err)}) catch "IMAP connect failed\n";
+        stderr_file.writeAll(msg) catch {};
+        return .{ .dmarc = 0, .tls = 0 };
+    };
+    defer client.deinit();
 
     const st = Store.init(allocator, data_dir, acct.name);
+
+    var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
+    defer fetched_set.deinit();
 
     // DMARC
     stdout_file.writeAll("Searching for DMARC reports...\n") catch {};
@@ -118,17 +131,26 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     };
     defer allocator.free(dmarc_uids);
 
+    var dmarc_new: usize = 0;
+    for (dmarc_uids) |uid| {
+        if (!fetched_set.contains(uid)) dmarc_new += 1;
+    }
+
     {
-        var buf: [64]u8 = undefined;
-        const found_msg = std.fmt.bufPrint(&buf, "Found {d} DMARC messages. Fetching...\n", .{dmarc_uids.len}) catch "Fetching...\n";
+        var buf: [128]u8 = undefined;
+        const found_msg = std.fmt.bufPrint(&buf, "Found {d} DMARC messages ({d} new). Fetching...\n", .{ dmarc_uids.len, dmarc_new }) catch "Fetching...\n";
         stdout_file.writeAll(found_msg) catch {};
     }
 
     var dmarc_count: u32 = 0;
-    for (dmarc_uids, 0..) |uid, idx| {
+    var tls_from_dmarc: u32 = 0;
+    var dmarc_progress: usize = 0;
+    for (dmarc_uids) |uid| {
+        if (fetched_set.contains(uid)) continue;
+        dmarc_progress += 1;
         {
             var pbuf: [64]u8 = undefined;
-            const progress = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ idx + 1, dmarc_uids.len }) catch "";
+            const progress = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ dmarc_progress, dmarc_new }) catch "";
             stderr_file.writeAll(progress) catch {};
         }
         const raw = client.fetchMessage(uid) catch continue;
@@ -144,16 +166,31 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
             allocator.free(attachments);
         }
 
+        var saved = false;
         for (attachments) |att| {
-            const xml_data = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
-            defer allocator.free(xml_data);
+            const decompressed = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
+            defer allocator.free(decompressed);
 
-            const report = reports.dmarc.parseXml(allocator, xml_data) catch continue;
-            st.saveDmarcReport(&report) catch continue;
-            dmarc_count += 1;
+            if (isTlsrptContentType(att.content_type)) {
+                const report = reports.mtasts.parseJson(allocator, decompressed) catch continue;
+                defer report.deinit(allocator);
+                st.saveTlsReport(&report) catch continue;
+                tls_from_dmarc += 1;
+                saved = true;
+            } else {
+                const report = reports.dmarc.parseXml(allocator, decompressed) catch continue;
+                defer report.deinit(allocator);
+                st.saveDmarcReport(&report) catch continue;
+                dmarc_count += 1;
+                saved = true;
+            }
+        }
+        if (saved) {
+            st.markUidFetched(uid);
+            fetched_set.put(uid, {}) catch {};
         }
     }
-    stderr_file.writeAll("\n") catch {};
+    if (dmarc_new > 0) stderr_file.writeAll("\n") catch {};
 
     // TLS-RPT
     stdout_file.writeAll("Searching for TLS-RPT reports...\n") catch {};
@@ -165,8 +202,27 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     };
     defer allocator.free(tls_uids);
 
-    var tls_count: u32 = 0;
+    var tls_new: usize = 0;
     for (tls_uids) |uid| {
+        if (!fetched_set.contains(uid)) tls_new += 1;
+    }
+
+    {
+        var buf: [128]u8 = undefined;
+        const found_msg = std.fmt.bufPrint(&buf, "Found {d} TLS-RPT messages ({d} new). Fetching...\n", .{ tls_uids.len, tls_new }) catch "Fetching...\n";
+        stdout_file.writeAll(found_msg) catch {};
+    }
+
+    var tls_count: u32 = 0;
+    var tls_progress: usize = 0;
+    for (tls_uids) |uid| {
+        if (fetched_set.contains(uid)) continue;
+        tls_progress += 1;
+        {
+            var pbuf: [64]u8 = undefined;
+            const progress = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ tls_progress, tls_new }) catch "";
+            stderr_file.writeAll(progress) catch {};
+        }
         const raw = client.fetchMessage(uid) catch continue;
         defer allocator.free(raw);
 
@@ -180,17 +236,25 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
             allocator.free(attachments);
         }
 
+        var tls_saved = false;
         for (attachments) |att| {
             const json_data = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
             defer allocator.free(json_data);
 
             const report = reports.mtasts.parseJson(allocator, json_data) catch continue;
+            defer report.deinit(allocator);
             st.saveTlsReport(&report) catch continue;
             tls_count += 1;
+            tls_saved = true;
+        }
+        if (tls_saved) {
+            st.markUidFetched(uid);
+            fetched_set.put(uid, {}) catch {};
         }
     }
+    if (tls_new > 0) stderr_file.writeAll("\n") catch {};
 
-    return .{ .dmarc = dmarc_count, .tls = tls_count };
+    return .{ .dmarc = dmarc_count, .tls = tls_count + tls_from_dmarc };
 }
 
 fn cmdDomains(allocator: std.mem.Allocator, format: []const u8, account: ?[]const u8) !void {
@@ -587,13 +651,13 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
     _ = allocator;
     var buf: [512]u8 = undefined;
 
-    const header = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<30} {s:<17} {s:<20}\n", .{
-        "ACCOUNT", "TYPE", "ORGANIZATION", "REPORT ID", "DATE", "DOMAIN",
+    const header = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<45} {s:<17} {s:<20} {s:<10}\n", .{
+        "ACCOUNT", "TYPE", "ORGANIZATION", "REPORT ID", "DATE", "DOMAIN", "POLICY",
     }) catch return;
     stdout_file.writeAll(header) catch {};
 
-    const sep = std.fmt.bufPrint(&buf, "{s:-<10} {s:-<8} {s:-<20} {s:-<30} {s:-<17} {s:-<20}\n", .{
-        "", "", "", "", "", "",
+    const sep = std.fmt.bufPrint(&buf, "{s:-<10} {s:-<8} {s:-<20} {s:-<45} {s:-<17} {s:-<20} {s:-<10}\n", .{
+        "", "", "", "", "", "", "",
     }) catch return;
     stdout_file.writeAll(sep) catch {};
 
@@ -602,13 +666,14 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
             .dmarc => "DMARC",
             .tlsrpt => "TLS-RPT",
         };
-        const line = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<30} {s:<17} {s:<20}\n", .{
+        const line = std.fmt.bufPrint(&buf, "{s:<10} {s:<8} {s:<20} {s:<45} {s:<17} {s:<20} {s:<10}\n", .{
             truncate(e.account_name, 9),
             type_str,
             truncate(e.org_name, 19),
-            truncate(e.report_id, 29),
+            truncate(e.report_id, 44),
             truncate(e.date_begin, 16),
             truncate(e.domain, 19),
+            truncate(e.policy, 9),
         }) catch continue;
         stdout_file.writeAll(line) catch {};
     }
@@ -622,8 +687,8 @@ fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.Re
             .dmarc => "dmarc",
             .tlsrpt => "tlsrpt",
         };
-        const json_entry = try std.fmt.allocPrint(allocator, "\n  {{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\"}}", .{
-            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain,
+        const json_entry = try std.fmt.allocPrint(allocator, "\n  {{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\"}}", .{
+            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain, e.policy,
         });
         defer allocator.free(json_entry);
         stdout_file.writeAll(json_entry) catch {};
@@ -751,9 +816,20 @@ const TlsDetailJson = struct {
     } = &.{},
 };
 
+fn isTlsrptContentType(ct: []const u8) bool {
+    return std.mem.indexOf(u8, ct, "application/tlsrpt+gzip") != null or
+        std.mem.indexOf(u8, ct, "application/tlsrpt+json") != null;
+}
+
 fn truncate(s: []const u8, max: usize) []const u8 {
     if (s.len <= max) return s;
     return s[0..max];
+}
+
+fn printVersion() void {
+    stdout_file.writeAll("reports version ") catch {};
+    stdout_file.writeAll(build_options.version) catch {};
+    stdout_file.writeAll("\n") catch {};
 }
 
 fn printUsage() void {
@@ -773,6 +849,7 @@ fn printUsage() void {
         \\  show <id>                    Show report details
         \\  summary                      Show summary statistics
         \\  domains                      List domains
+        \\  version                      Show version
         \\  help                         Show this help
         \\
         \\Options:
@@ -888,4 +965,13 @@ test "periodKey returns error for invalid month or day" {
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-13-15 00:00", "week"));
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-06-00 00:00", "week"));
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-06-32 00:00", "week"));
+}
+
+test "isTlsrptContentType" {
+    try std.testing.expect(isTlsrptContentType("application/tlsrpt+gzip"));
+    try std.testing.expect(isTlsrptContentType("application/tlsrpt+json"));
+    try std.testing.expect(isTlsrptContentType("application/tlsrpt+gzip; name=\"report.gz\""));
+    try std.testing.expect(!isTlsrptContentType("application/gzip"));
+    try std.testing.expect(!isTlsrptContentType("application/xml"));
+    try std.testing.expect(!isTlsrptContentType("text/plain"));
 }

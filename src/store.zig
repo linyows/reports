@@ -16,6 +16,7 @@ pub const ReportEntry = struct {
     date_begin: []const u8,
     date_end: []const u8,
     domain: []const u8,
+    policy: []const u8,
     filename: []const u8,
 };
 
@@ -32,8 +33,10 @@ pub const Store = struct {
         const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "dmarc" });
         defer self.allocator.free(dir);
 
+        const slug = try slugify(self.allocator, report.metadata.org_name);
+        defer self.allocator.free(slug);
         const filename = try std.fmt.allocPrint(self.allocator, "{s}_{s}.json", .{
-            report.metadata.org_name, report.metadata.report_id,
+            slug, report.metadata.report_id,
         });
         defer self.allocator.free(filename);
 
@@ -52,8 +55,10 @@ pub const Store = struct {
         const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "tlsrpt" });
         defer self.allocator.free(dir);
 
+        const slug = try slugify(self.allocator, report.organization_name);
+        defer self.allocator.free(slug);
         const filename = try std.fmt.allocPrint(self.allocator, "{s}_{s}.json", .{
-            report.organization_name, report.report_id,
+            slug, report.report_id,
         });
         defer self.allocator.free(filename);
 
@@ -66,6 +71,42 @@ pub const Store = struct {
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(json);
+    }
+
+    pub fn loadFetchedUids(self: *const Store) !std.AutoHashMap(u32, void) {
+        var set = std.AutoHashMap(u32, void).init(self.allocator);
+
+        const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, ".fetched_uids" });
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch return set;
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1 * 1024 * 1024) catch return set;
+        defer self.allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \r");
+            if (trimmed.len == 0) continue;
+            const uid = std.fmt.parseInt(u32, trimmed, 10) catch continue;
+            set.put(uid, {}) catch continue;
+        }
+
+        return set;
+    }
+
+    pub fn markUidFetched(self: *const Store, uid: u32) void {
+        const path = std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, ".fetched_uids" }) catch return;
+        defer self.allocator.free(path);
+
+        const file = std.fs.createFileAbsolute(path, .{ .truncate = false }) catch return;
+        defer file.close();
+        file.seekFromEnd(0) catch {};
+
+        var buf: [16]u8 = undefined;
+        const uid_str = std.fmt.bufPrint(&buf, "{d}\n", .{uid}) catch return;
+        file.writeAll(uid_str) catch {};
     }
 
     pub fn listReports(self: *const Store) ![]ReportEntry {
@@ -183,6 +224,7 @@ pub fn freeReportEntries(allocator: Allocator, entries: []const ReportEntry) voi
         allocator.free(e.date_begin);
         allocator.free(e.date_end);
         allocator.free(e.domain);
+        allocator.free(e.policy);
         allocator.free(e.filename);
     }
     allocator.free(entries);
@@ -211,6 +253,7 @@ fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: Repor
                 .date_begin = try formatTimestamp(allocator, j.metadata.date_begin),
                 .date_end = try formatTimestamp(allocator, j.metadata.date_end),
                 .domain = try allocator.dupe(u8, j.policy.domain),
+                .policy = try allocator.dupe(u8, j.policy.policy),
                 .filename = try allocator.dupe(u8, filename),
             };
         },
@@ -227,6 +270,7 @@ fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: Repor
                 .date_begin = try allocator.dupe(u8, j.start_datetime),
                 .date_end = try allocator.dupe(u8, j.end_datetime),
                 .domain = try allocator.dupe(u8, if (j.policies.len > 0) j.policies[0].policy_domain else ""),
+                .policy = try allocator.dupe(u8, if (j.policies.len > 0) j.policies[0].policy_type else ""),
                 .filename = try allocator.dupe(u8, filename),
             };
         },
@@ -242,6 +286,7 @@ const DmarcJson = struct {
     },
     policy: struct {
         domain: []const u8 = "",
+        policy: []const u8 = "",
     },
 };
 
@@ -252,8 +297,34 @@ const TlsJson = struct {
     end_datetime: []const u8 = "",
     policies: []const struct {
         policy_domain: []const u8 = "",
+        policy_type: []const u8 = "",
     } = &.{},
 };
+
+fn slugify(allocator: Allocator, input: []const u8) ![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    var prev_hyphen = false;
+    for (input) |ch| {
+        if (std.ascii.isAlphanumeric(ch)) {
+            try result.append(allocator, std.ascii.toLower(ch));
+            prev_hyphen = false;
+        } else if (ch == '.' or ch == '_') {
+            try result.append(allocator, ch);
+            prev_hyphen = false;
+        } else if (ch == ' ' or ch == '-' or ch == '/' or ch == '@') {
+            if (!prev_hyphen and result.items.len > 0) {
+                try result.append(allocator, '-');
+                prev_hyphen = true;
+            }
+        }
+        // Other characters (multibyte, special chars) are dropped
+    }
+    // Trim trailing hyphen
+    while (result.items.len > 0 and result.items[result.items.len - 1] == '-') {
+        result.items.len -= 1;
+    }
+    return result.toOwnedSlice(allocator);
+}
 
 fn formatTimestamp(allocator: Allocator, ts: i64) ![]const u8 {
     if (ts == 0) return try allocator.dupe(u8, "");
@@ -272,6 +343,41 @@ fn formatTimestamp(allocator: Allocator, ts: i64) ![]const u8 {
 }
 
 // --- Tests ---
+
+test "slugify ascii domain" {
+    const allocator = std.testing.allocator;
+    const s = try slugify(allocator, "google.com");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("google.com", s);
+}
+
+test "slugify with spaces and caps" {
+    const allocator = std.testing.allocator;
+    const s = try slugify(allocator, "Google Inc.");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("google-inc.", s);
+}
+
+test "slugify strips multibyte and special chars" {
+    const allocator = std.testing.allocator;
+    const s = try slugify(allocator, "日本語テスト Corp.");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("corp.", s);
+}
+
+test "slugify collapses hyphens" {
+    const allocator = std.testing.allocator;
+    const s = try slugify(allocator, "a  - b");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("a-b", s);
+}
+
+test "slugify email-like report id" {
+    const allocator = std.testing.allocator;
+    const s = try slugify(allocator, "<2026.04.09T00.00.00Z+one.sakura.ad.jp@google.com>");
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("2026.04.09t00.00.00z-one.sakura.ad.jp-google.com", s);
+}
 
 test "formatTimestamp formats correctly" {
     const allocator = std.testing.allocator;
@@ -300,6 +406,7 @@ test "parseEntryFromJson parses dmarc entry with account" {
         allocator.free(entry.date_begin);
         allocator.free(entry.date_end);
         allocator.free(entry.domain);
+        allocator.free(entry.policy);
         allocator.free(entry.filename);
     }
 

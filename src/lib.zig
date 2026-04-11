@@ -23,7 +23,7 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
     for (cfg.accounts) |acct| {
         if (acct.host.len == 0) continue;
 
-        const client = reports.imap.Client.init(
+        var client = reports.imap.Client.init(
             allocator,
             acct.host,
             acct.port,
@@ -32,14 +32,20 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
             acct.mailbox,
             acct.tls,
         );
+        client.connect() catch continue;
+        defer client.deinit();
 
         const st = reports.store.Store.init(allocator, cfg.data_dir, acct.name);
+
+        var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
+        defer fetched_set.deinit();
 
         // DMARC
         const dmarc_uids = client.searchDmarcReports() catch continue;
         defer allocator.free(dmarc_uids);
 
         for (dmarc_uids) |uid| {
+            if (fetched_set.contains(uid)) continue;
             const raw = client.fetchMessage(uid) catch continue;
             defer allocator.free(raw);
 
@@ -53,11 +59,18 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
                 allocator.free(attachments);
             }
 
+            var saved = false;
             for (attachments) |att| {
                 const xml_data = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
                 defer allocator.free(xml_data);
                 const report = reports.dmarc.parseXml(allocator, xml_data) catch continue;
+                defer report.deinit(allocator);
                 st.saveDmarcReport(&report) catch continue;
+                saved = true;
+            }
+            if (saved) {
+                st.markUidFetched(uid);
+                fetched_set.put(uid, {}) catch {};
             }
         }
 
@@ -66,6 +79,7 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
         defer allocator.free(tls_uids);
 
         for (tls_uids) |uid| {
+            if (fetched_set.contains(uid)) continue;
             const raw = client.fetchMessage(uid) catch continue;
             defer allocator.free(raw);
 
@@ -79,11 +93,18 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
                 allocator.free(attachments);
             }
 
+            var tls_saved = false;
             for (attachments) |att| {
                 const json_data = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
                 defer allocator.free(json_data);
                 const report = reports.mtasts.parseJson(allocator, json_data) catch continue;
+                defer report.deinit(allocator);
                 st.saveTlsReport(&report) catch continue;
+                tls_saved = true;
+            }
+            if (tls_saved) {
+                st.markUidFetched(uid);
+                fetched_set.put(uid, {}) catch {};
             }
         }
     }
@@ -109,8 +130,8 @@ export fn reports_list(config_json: [*:0]const u8) ?[*:0]u8 {
             .dmarc => "dmarc",
             .tlsrpt => "tlsrpt",
         };
-        const json_entry = std.fmt.allocPrint(allocator, "{{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\"}}", .{
-            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain,
+        const json_entry = std.fmt.allocPrint(allocator, "{{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\"}}", .{
+            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain, e.policy,
         }) catch return null;
         defer allocator.free(json_entry);
         buf.appendSlice(allocator, json_entry) catch return null;

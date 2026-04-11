@@ -1,8 +1,12 @@
 const std = @import("std");
+const build_zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", build_zon.version);
 
     // Core library module
     const mod = b.addModule("reports", .{
@@ -35,6 +39,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addOptions("build_options", options);
     b.installArtifact(exe);
 
     // Static library for C ABI (SwiftUI integration)
@@ -68,15 +73,17 @@ pub fn build(b: *std.Build) void {
     // Test step
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    const exe_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "reports", .module = mod },
+        },
+    });
+    exe_test_mod.addOptions("build_options", options);
     const exe_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "reports", .module = mod },
-            },
-        }),
+        .root_module = exe_test_mod,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run tests");

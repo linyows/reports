@@ -47,6 +47,39 @@ pub const Report = struct {
         selector: []const u8,
     };
 
+    pub fn deinit(self: *const Report, allocator: Allocator) void {
+        allocator.free(self.metadata.org_name);
+        allocator.free(self.metadata.email);
+        allocator.free(self.metadata.report_id);
+        allocator.free(self.policy.domain);
+        allocator.free(self.policy.adkim);
+        allocator.free(self.policy.aspf);
+        allocator.free(self.policy.policy);
+        allocator.free(self.policy.sub_policy);
+        for (self.records) |rec| {
+            allocator.free(rec.source_ip);
+            allocator.free(rec.disposition);
+            allocator.free(rec.dkim_eval);
+            allocator.free(rec.spf_eval);
+            allocator.free(rec.header_from);
+            allocator.free(rec.envelope_from);
+            allocator.free(rec.envelope_to);
+            for (rec.dkim_results) |r| {
+                allocator.free(r.domain);
+                allocator.free(r.result);
+                allocator.free(r.selector);
+            }
+            allocator.free(rec.dkim_results);
+            for (rec.spf_results) |r| {
+                allocator.free(r.domain);
+                allocator.free(r.result);
+                allocator.free(r.selector);
+            }
+            allocator.free(rec.spf_results);
+        }
+        allocator.free(self.records);
+    }
+
     pub fn toJson(self: *const Report, allocator: Allocator) ![]const u8 {
         return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(self.*, .{})});
     }
@@ -292,39 +325,6 @@ fn textContent(allocator: Allocator, node: *c.xmlNode) ![]const u8 {
 
 // --- Tests ---
 
-fn freeReport(allocator: Allocator, report: Report) void {
-    allocator.free(report.metadata.org_name);
-    allocator.free(report.metadata.email);
-    allocator.free(report.metadata.report_id);
-    allocator.free(report.policy.domain);
-    allocator.free(report.policy.adkim);
-    allocator.free(report.policy.aspf);
-    allocator.free(report.policy.policy);
-    allocator.free(report.policy.sub_policy);
-    for (report.records) |rec| {
-        allocator.free(rec.source_ip);
-        allocator.free(rec.disposition);
-        allocator.free(rec.dkim_eval);
-        allocator.free(rec.spf_eval);
-        allocator.free(rec.header_from);
-        allocator.free(rec.envelope_from);
-        allocator.free(rec.envelope_to);
-        for (rec.dkim_results) |ar| {
-            allocator.free(ar.domain);
-            allocator.free(ar.result);
-            allocator.free(ar.selector);
-        }
-        allocator.free(rec.dkim_results);
-        for (rec.spf_results) |ar| {
-            allocator.free(ar.domain);
-            allocator.free(ar.result);
-            allocator.free(ar.selector);
-        }
-        allocator.free(rec.spf_results);
-    }
-    allocator.free(report.records);
-}
-
 test "parse basic dmarc xml" {
     const allocator = std.testing.allocator;
     const xml_data =
@@ -368,7 +368,7 @@ test "parse basic dmarc xml" {
     ;
 
     const report = try parseXml(allocator, xml_data);
-    defer freeReport(allocator, report);
+    defer report.deinit(allocator);
 
     try std.testing.expectEqualStrings("google.com", report.metadata.org_name);
     try std.testing.expectEqualStrings("noreply-dmarc-support@google.com", report.metadata.email);
@@ -434,7 +434,7 @@ test "parse dmarc xml with multiple records" {
     ;
 
     const report = try parseXml(allocator, xml_data);
-    defer freeReport(allocator, report);
+    defer report.deinit(allocator);
 
     try std.testing.expectEqualStrings("yahoo.com", report.metadata.org_name);
     try std.testing.expectEqualStrings("quarantine", report.policy.policy);
