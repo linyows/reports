@@ -150,7 +150,6 @@ pub fn parseJson(allocator: Allocator, data: []const u8) !Report {
 
 // --- Tests ---
 
-
 test "parse tlsrpt json with policy and failures" {
     const allocator = std.testing.allocator;
     const json_data =

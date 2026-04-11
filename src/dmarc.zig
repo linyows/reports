@@ -325,7 +325,6 @@ fn textContent(allocator: Allocator, node: *c.xmlNode) ![]const u8 {
 
 // --- Tests ---
 
-
 test "parse basic dmarc xml" {
     const allocator = std.testing.allocator;
     const xml_data =
