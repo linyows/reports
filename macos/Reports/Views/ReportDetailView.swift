@@ -55,7 +55,11 @@ struct ReportDetailView: View {
                 metadataRow("Organization:", report.metadata.org_name)
                 metadataRow("Report ID:", report.metadata.report_id)
                 metadataRow("Domain:", report.policy.domain)
-                metadataRow("Policy:", report.policy.policy)
+                GridRow {
+                    Text("Policy:")
+                        .foregroundStyle(.secondary)
+                    BadgeLabel(text: report.policy.policy, color: policyColor(report.policy.policy))
+                }
             }
             .font(.system(.body, design: .monospaced))
             .padding(.bottom, 12)
