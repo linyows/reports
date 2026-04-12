@@ -3,7 +3,6 @@ import SwiftUI
 @main
 struct ReportsApp: App {
     @StateObject private var viewModel = ReportsViewModel()
-
     var body: some Scene {
         WindowGroup {
             ContentView()

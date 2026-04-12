@@ -18,15 +18,33 @@ func policyColor(_ policy: String) -> Color {
     }
 }
 
-// MARK: - Hash-based label color (deterministic per unique string)
+// MARK: - Label color registry (unique colors while palette allows, then hash fallback)
 
 private let labelPalette: [Color] = [
-    .red, .orange, .yellow, .green, .mint, .teal, .cyan, .blue, .indigo, .purple, .pink, .brown,
+    .blue, .orange, .green, .purple, .red, .teal, .pink, .indigo, .mint, .cyan, .brown, .yellow,
 ]
 
+final class LabelColorRegistry: @unchecked Sendable {
+    static let shared = LabelColorRegistry()
+    private var assignments: [String: Color] = [:]
+    private var nextIndex = 0
+
+    func color(for text: String) -> Color {
+        if let existing = assignments[text] { return existing }
+        let color = labelPalette[nextIndex % labelPalette.count]
+        nextIndex += 1
+        assignments[text] = color
+        return color
+    }
+
+    func reset() {
+        assignments.removeAll()
+        nextIndex = 0
+    }
+}
+
 func labelColor(for text: String) -> Color {
-    let hash = text.utf8.reduce(0) { ($0 &* 31) &+ UInt($1) }
-    return labelPalette[Int(hash % UInt(labelPalette.count))]
+    LabelColorRegistry.shared.color(for: text)
 }
 
 enum ReportType: String, Codable, CaseIterable, Identifiable {

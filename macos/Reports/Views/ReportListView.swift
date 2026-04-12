@@ -66,6 +66,12 @@ struct ReportListView: View {
     }
 
     private var navigationTitle: String {
+        if let account = viewModel.filterAccount {
+            return account
+        }
+        if let domain = viewModel.filterDomain {
+            return domain
+        }
         if let filterType = viewModel.filterType {
             return filterType.displayName
         }
