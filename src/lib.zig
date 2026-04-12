@@ -40,11 +40,10 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
         var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
         defer fetched_set.deinit();
 
-        // DMARC
-        const dmarc_uids = client.searchDmarcReports() catch continue;
-        defer allocator.free(dmarc_uids);
+        const uids = client.searchReports() catch continue;
+        defer allocator.free(uids);
 
-        for (dmarc_uids) |uid| {
+        for (uids) |uid| {
             if (fetched_set.contains(uid)) continue;
             const raw = client.fetchMessage(uid) catch continue;
             defer allocator.free(raw);
@@ -61,48 +60,21 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
 
             var saved = false;
             for (attachments) |att| {
-                const xml_data = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
-                defer allocator.free(xml_data);
-                const report = reports.dmarc.parseXml(allocator, xml_data) catch continue;
-                defer report.deinit(allocator);
-                st.saveDmarcReport(&report) catch continue;
-                saved = true;
+                const decompressed = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
+                defer allocator.free(decompressed);
+
+                if (reports.mtasts.parseJson(allocator, decompressed)) |report| {
+                    defer report.deinit(allocator);
+                    st.saveTlsReport(&report) catch continue;
+                    saved = true;
+                } else |_| {
+                    const report = reports.dmarc.parseXml(allocator, decompressed) catch continue;
+                    defer report.deinit(allocator);
+                    st.saveDmarcReport(&report) catch continue;
+                    saved = true;
+                }
             }
             if (saved) {
-                st.markUidFetched(uid);
-                fetched_set.put(uid, {}) catch {};
-            }
-        }
-
-        // TLS-RPT
-        const tls_uids = client.searchTlsReports() catch continue;
-        defer allocator.free(tls_uids);
-
-        for (tls_uids) |uid| {
-            if (fetched_set.contains(uid)) continue;
-            const raw = client.fetchMessage(uid) catch continue;
-            defer allocator.free(raw);
-
-            const attachments = reports.mime.extractAttachments(allocator, raw) catch continue;
-            defer {
-                for (attachments) |att| {
-                    allocator.free(att.filename);
-                    allocator.free(att.content_type);
-                    allocator.free(att.data);
-                }
-                allocator.free(attachments);
-            }
-
-            var tls_saved = false;
-            for (attachments) |att| {
-                const json_data = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
-                defer allocator.free(json_data);
-                const report = reports.mtasts.parseJson(allocator, json_data) catch continue;
-                defer report.deinit(allocator);
-                st.saveTlsReport(&report) catch continue;
-                tls_saved = true;
-            }
-            if (tls_saved) {
                 st.markUidFetched(uid);
                 fetched_set.put(uid, {}) catch {};
             }
@@ -130,8 +102,9 @@ export fn reports_list(config_json: [*:0]const u8) ?[*:0]u8 {
             .dmarc => "dmarc",
             .tlsrpt => "tlsrpt",
         };
-        const json_entry = std.fmt.allocPrint(allocator, "{{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\"}}", .{
-            e.account_name, type_str, e.org_name, e.report_id, e.date_begin, e.domain, e.policy,
+        const hash_id = filenameToHashId(e.filename);
+        const json_entry = std.fmt.allocPrint(allocator, "{{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\",\"filename\":\"{s}\"}}", .{
+            e.account_name, type_str, e.org_name, hash_id, e.date_begin, e.domain, e.policy, e.filename,
         }) catch return null;
         defer allocator.free(json_entry);
         buf.appendSlice(allocator, json_entry) catch return null;
@@ -163,6 +136,13 @@ export fn reports_show(config_json: [*:0]const u8, report_type: [*:0]const u8, a
     };
     allocator.free(data);
     return result.ptr;
+}
+
+fn filenameToHashId(filename: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, filename, ".json")) {
+        return filename[0 .. filename.len - 5];
+    }
+    return filename;
 }
 
 export fn reports_free_string(ptr: ?[*:0]u8) void {
