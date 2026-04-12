@@ -1,6 +1,8 @@
-.PHONY: all lib xcframework xcode build dmg open clean
+.PHONY: all lib xcframework xcode build dmg icon open clean
 
 APP_NAME := Reports
+ICON_SVG := ../misc/reports-icon.svg
+ICON_DIR := Reports/Assets.xcassets/AppIcon.appiconset
 BUILD_DIR := $(shell xcodebuild -project Reports.xcodeproj -scheme $(APP_NAME) -configuration Release -showBuildSettings 2>/dev/null | grep -m1 'BUILT_PRODUCTS_DIR' | awk '{print $$3}')
 DMG_NAME := $(APP_NAME)-macOS-arm64
 
@@ -35,6 +37,15 @@ dmg: build
 		-ov -format UDZO "$(DMG_NAME).dmg"
 	rm -rf dmg_staging
 	@echo "==> Created $(DMG_NAME).dmg"
+
+# Generate app icon PNGs from SVG
+icon:
+	@command -v magick >/dev/null 2>&1 || { echo "Install ImageMagick: brew install imagemagick"; exit 1; }
+	@echo "==> Generating app icons from $(ICON_SVG)..."
+	@for size in 16 32 64 128 256 512 1024; do \
+		magick "$(ICON_SVG)" -resize $${size}x$${size} -background none "$(ICON_DIR)/icon_$${size}x$${size}.png"; \
+	done
+	@echo "==> App icons generated in $(ICON_DIR)"
 
 # Build XCFramework + generate project + open in Xcode
 open: xcframework xcode
