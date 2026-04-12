@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build
+  build-cli:
+    name: Build CLI
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -65,9 +65,66 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
 
+  build-app:
+    name: Build macOS App
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/\.version = \"[^\"]*\",/.version = \"${VERSION}\",/" build.zig.zon
+          rm -f build.zig.zon.bak
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install dependencies
+        run: |
+          brew install libxml2 curl xcodegen
+
+      - name: Build XCFramework
+        run: cd macos && ./build.sh
+
+      - name: Generate Xcode project
+        run: cd macos && xcodegen generate
+
+      - name: Build app
+        run: |
+          cd macos
+          xcodebuild -project Reports.xcodeproj -scheme Reports \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Create DMG
+        run: |
+          cd macos
+          BUILD_DIR=$(xcodebuild -project Reports.xcodeproj -scheme Reports \
+            -configuration Release -showBuildSettings 2>/dev/null \
+            | grep -m1 'BUILT_PRODUCTS_DIR' | awk '{print $3}')
+          rm -rf dmg_staging
+          mkdir -p dmg_staging
+          cp -R "$BUILD_DIR/Reports.app" dmg_staging/
+          ln -s /Applications dmg_staging/Applications
+          hdiutil create -volname "Reports" -srcfolder dmg_staging \
+            -ov -format UDZO "Reports-macOS-arm64.dmg"
+          rm -rf dmg_staging
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Reports-macOS-arm64
+          path: macos/Reports-macOS-arm64.dmg
+
   release:
     name: Release
-    needs: build
+    needs: [build-cli, build-app]
     runs-on: ubuntu-latest
 
     steps:
@@ -81,10 +138,14 @@ jobs:
           mkdir -p release
           for dir in artifacts/*/; do
             name=$(basename "$dir")
-            cp "$dir$name.tar.gz" "release/"
+            if [ -f "$dir$name.tar.gz" ]; then
+              cp "$dir$name.tar.gz" "release/"
+            elif [ -f "$dir$name.dmg" ]; then
+              cp "$dir$name.dmg" "release/"
+            fi
           done
           cd release
-          sha256sum *.tar.gz > checksums.txt
+          sha256sum * > checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

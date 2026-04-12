@@ -22,6 +22,9 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.linyows.reports
         PRODUCT_NAME: Reports
         INFOPLIST_FILE: Reports/Info.plist
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
         OTHER_LDFLAGS:
           - -lxml2
           - -lcurl
