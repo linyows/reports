@@ -55,12 +55,8 @@ pub const Client = struct {
         }
     }
 
-    pub fn searchDmarcReports(self: *const Client) ![]u32 {
-        return self.search("UID SEARCH SUBJECT \"Report Domain:\"");
-    }
-
-    pub fn searchTlsReports(self: *const Client) ![]u32 {
-        return self.search("UID SEARCH SUBJECT \"TLS-RPT\"");
+    pub fn searchReports(self: *const Client) ![]u32 {
+        return self.search("UID SEARCH OR SUBJECT \"Report Domain:\" SUBJECT \"TLS-RPT\"");
     }
 
     pub fn fetchMessage(self: *const Client, uid: u32) ![]const u8 {

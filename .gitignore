@@ -1,2 +1,6 @@
 zig-out/
 .zig-cache/
+macos/Reports.xcodeproj/
+macos/ReportsKit.xcframework/
+macos/ReportsKit/reports.h
+macos/build/

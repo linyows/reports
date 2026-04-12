@@ -34,11 +34,7 @@ pub const Store = struct {
         const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "dmarc" });
         defer self.allocator.free(dir);
 
-        const slug = try zlug.slugifyAlloc(self.allocator, report.metadata.org_name, .{});
-        defer self.allocator.free(slug);
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}_{s}.json", .{
-            slug, report.metadata.report_id,
-        });
+        const filename = try hashFilename(self.allocator, report.metadata.org_name, report.metadata.report_id);
         defer self.allocator.free(filename);
 
         const path = try std.fs.path.join(self.allocator, &.{ dir, filename });
@@ -56,11 +52,7 @@ pub const Store = struct {
         const dir = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "tlsrpt" });
         defer self.allocator.free(dir);
 
-        const slug = try zlug.slugifyAlloc(self.allocator, report.organization_name, .{});
-        defer self.allocator.free(slug);
-        const filename = try std.fmt.allocPrint(self.allocator, "{s}_{s}.json", .{
-            slug, report.report_id,
-        });
+        const filename = try hashFilename(self.allocator, report.organization_name, report.report_id);
         defer self.allocator.free(filename);
 
         const path = try std.fs.path.join(self.allocator, &.{ dir, filename });
@@ -268,8 +260,8 @@ fn parseEntryFromJson(allocator: Allocator, data: []const u8, report_type: Repor
                 .account_name = try allocator.dupe(u8, account_name),
                 .org_name = try allocator.dupe(u8, j.organization_name),
                 .report_id = try allocator.dupe(u8, j.report_id),
-                .date_begin = try allocator.dupe(u8, j.start_datetime),
-                .date_end = try allocator.dupe(u8, j.end_datetime),
+                .date_begin = try formatIsoDatetime(allocator, j.start_datetime),
+                .date_end = try formatIsoDatetime(allocator, j.end_datetime),
                 .domain = try allocator.dupe(u8, if (j.policies.len > 0) j.policies[0].policy_domain else ""),
                 .policy = try allocator.dupe(u8, if (j.policies.len > 0) j.policies[0].policy_type else ""),
                 .filename = try allocator.dupe(u8, filename),
@@ -302,6 +294,16 @@ const TlsJson = struct {
     } = &.{},
 };
 
+/// Generate a hash-based filename: {16-char hex}.json
+fn hashFilename(allocator: Allocator, org: []const u8, report_id: []const u8) ![]const u8 {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(org);
+    hasher.update(":");
+    hasher.update(report_id);
+    const hash = hasher.final();
+    return std.fmt.allocPrint(allocator, "{x:0>16}.json", .{hash});
+}
+
 fn formatTimestamp(allocator: Allocator, ts: i64) ![]const u8 {
     if (ts == 0) return try allocator.dupe(u8, "");
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
@@ -316,6 +318,16 @@ fn formatTimestamp(allocator: Allocator, ts: i64) ![]const u8 {
         daytime.getHoursIntoDay(),
         daytime.getMinutesIntoHour(),
     });
+}
+
+/// Convert ISO 8601 datetime (e.g. "2026-04-10T00:00:00Z") to "YYYY-MM-DD HH:MM".
+fn formatIsoDatetime(allocator: Allocator, iso: []const u8) ![]const u8 {
+    // Expect at least "YYYY-MM-DDThh:mm"
+    if (iso.len >= 16 and iso[10] == 'T') {
+        return std.fmt.allocPrint(allocator, "{s} {s}", .{ iso[0..10], iso[11..16] });
+    }
+    // Already in the right format or unknown — return as-is
+    return allocator.dupe(u8, iso);
 }
 
 // --- Tests ---

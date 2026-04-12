@@ -1,0 +1,35 @@
+name: Reports
+options:
+  bundleIdPrefix: com.linyows
+  deploymentTarget:
+    macOS: "26.2"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.2"
+
+targets:
+  Reports:
+    type: application
+    platform: macOS
+    sources:
+      - Reports
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.linyows.reports
+        PRODUCT_NAME: Reports
+        INFOPLIST_FILE: Reports/Info.plist
+        OTHER_LDFLAGS:
+          - -lxml2
+          - -lcurl
+          - -lz
+    dependencies:
+      - framework: ReportsKit.xcframework
+        embed: false
+    info:
+      path: Reports/Info.plist
+    entitlements:
+      path: Reports/Reports.entitlements

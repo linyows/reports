@@ -64,6 +64,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    lib.bundle_compiler_rt = true;
     b.installArtifact(lib);
 
     // Install C header for Swift integration
