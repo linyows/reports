@@ -11,7 +11,6 @@ struct ContentView: View {
         } detail: {
             ReportDetailView()
         }
-        .navigationSplitViewStyle(.balanced)
         .onAppear {
             viewModel.loadReports()
         }
