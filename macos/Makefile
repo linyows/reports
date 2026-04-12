@@ -1,4 +1,8 @@
-.PHONY: all lib xcframework xcode build open clean
+.PHONY: all lib xcframework xcode build dmg open clean
+
+APP_NAME := Reports
+BUILD_DIR := $(shell xcodebuild -project Reports.xcodeproj -scheme $(APP_NAME) -configuration Release -showBuildSettings 2>/dev/null | grep -m1 'BUILT_PRODUCTS_DIR' | awk '{print $$3}')
+DMG_NAME := $(APP_NAME)-macOS-arm64
 
 # Build everything: Zig library + XCFramework + Xcode project + app
 all: xcframework xcode build
@@ -18,7 +22,19 @@ xcode:
 
 # Build the macOS app via xcodebuild
 build: Reports.xcodeproj
-	xcodebuild -project Reports.xcodeproj -scheme Reports -configuration Release build
+	xcodebuild -project Reports.xcodeproj -scheme $(APP_NAME) -configuration Release build
+
+# Create DMG for distribution
+dmg: build
+	@echo "==> Creating DMG..."
+	rm -rf dmg_staging $(DMG_NAME).dmg
+	mkdir -p dmg_staging
+	cp -R "$(BUILD_DIR)/$(APP_NAME).app" dmg_staging/
+	ln -s /Applications dmg_staging/Applications
+	hdiutil create -volname "$(APP_NAME)" -srcfolder dmg_staging \
+		-ov -format UDZO "$(DMG_NAME).dmg"
+	rm -rf dmg_staging
+	@echo "==> Created $(DMG_NAME).dmg"
 
 # Build XCFramework + generate project + open in Xcode
 open: xcframework xcode
@@ -29,3 +45,4 @@ clean:
 	rm -rf ReportsKit.xcframework
 	rm -rf Reports.xcodeproj
 	rm -rf ReportsKit/reports.h
+	rm -rf dmg_staging *.dmg
