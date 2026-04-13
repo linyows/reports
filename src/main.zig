@@ -779,7 +779,7 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
             .{ .val = "SOURCE IP", .width = w_ip },
             .{ .val = "PTR", .width = w_ptr },
             .{ .val = "ASN", .width = w_asn },
-            .{ .val = "\xf0\x9f\x8f\xb3", .width = 2 }, // 🏳 (flag placeholder in header)
+            .{ .val = "CC", .width = 2 },
             .{ .val = "COUNT", .width = 5 },
             .{ .val = "DISP", .width = w_disp },
             .{ .val = "FROM", .width = w_from },
@@ -837,15 +837,27 @@ const ColSpec = struct {
 fn writeTableRow(allocator: std.mem.Allocator, cols: []const ColSpec) !void {
     for (cols, 0..) |col, i| {
         if (i > 0) stdout_file.writeAll(" ") catch {};
-        stdout_file.writeAll(truncate(col.val, if (col.is_emoji) col.val.len else col.width)) catch {};
 
-        // Pad: emoji bytes are longer than display width, so use display_width for padding
-        const display_len = if (col.is_emoji) flagDisplayWidth(col.val) else truncate(col.val, col.width).len;
-        if (display_len < col.width) {
-            const pad = allocator.alloc(u8, col.width - display_len) catch continue;
-            defer allocator.free(pad);
-            @memset(pad, ' ');
-            stdout_file.writeAll(pad) catch {};
+        if (col.is_emoji) {
+            // Emoji: write full bytes, pad based on display width (not byte count)
+            stdout_file.writeAll(col.val) catch {};
+            const display_w = flagDisplayWidth(col.val);
+            if (display_w < col.width) {
+                const pad = allocator.alloc(u8, col.width - display_w) catch continue;
+                defer allocator.free(pad);
+                @memset(pad, ' ');
+                stdout_file.writeAll(pad) catch {};
+            }
+        } else {
+            // Normal text: truncate to column width, pad remainder
+            const text = truncate(col.val, col.width);
+            stdout_file.writeAll(text) catch {};
+            if (text.len < col.width) {
+                const pad = allocator.alloc(u8, col.width - text.len) catch continue;
+                defer allocator.free(pad);
+                @memset(pad, ' ');
+                stdout_file.writeAll(pad) catch {};
+            }
         }
     }
     stdout_file.writeAll("\n") catch {};
