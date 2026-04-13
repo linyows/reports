@@ -34,6 +34,7 @@ pub fn main() !void {
     const domain = getOption(args, "--domain");
     const period = getOption(args, "--period");
     const report_type = getOption(args, "--type");
+    const enrich = !hasFlag(args, "--no-enrich");
 
     if (std.mem.eql(u8, command, "fetch")) {
         try cmdFetch(allocator, account);
@@ -44,7 +45,7 @@ pub fn main() !void {
             stderr_file.writeAll("Usage: reports show <report-id>\n") catch {};
             return;
         }
-        try cmdShow(allocator, args[2], format orelse "table");
+        try cmdShow(allocator, args[2], format orelse "table", enrich);
     } else if (std.mem.eql(u8, command, "domains")) {
         try cmdDomains(allocator, format orelse "table", account);
     } else if (std.mem.eql(u8, command, "summary")) {
@@ -269,7 +270,7 @@ fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8
     }
 }
 
-fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const u8) !void {
+fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const u8, enrich: bool) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
 
@@ -292,7 +293,7 @@ fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const 
                         stdout_file.writeAll(data) catch {};
                         stdout_file.writeAll("\n") catch {};
                     } else {
-                        try showDmarcTable(allocator, data);
+                        try showDmarcTable(allocator, data, enrich);
                     }
                 },
                 .tlsrpt => {
@@ -303,7 +304,7 @@ fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const 
                         stdout_file.writeAll(data) catch {};
                         stdout_file.writeAll("\n") catch {};
                     } else {
-                        try showTlsTable(allocator, data);
+                        try showTlsTable(allocator, data, enrich);
                     }
                 },
             }
@@ -616,18 +617,49 @@ const DmarcStatsJson = struct {
 };
 
 fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.ReportEntry) !void {
-    _ = allocator;
-    var buf: [512]u8 = undefined;
+    // Compute dynamic column widths from data
+    var w_id: usize = "ID".len;
+    var w_acct: usize = "ACCOUNT".len;
+    var w_type: usize = "TYPE".len;
+    var w_date: usize = "DATE".len;
+    var w_domain: usize = "DOMAIN".len;
+    var w_org: usize = "ORGANIZATION".len;
+    var w_policy: usize = "POLICY".len;
 
-    const header = std.fmt.bufPrint(&buf, "{s:<16} {s:<10} {s:<8} {s:<17} {s:<20} {s:<18} {s:<10}\n", .{
-        "ID", "ACCOUNT", "TYPE", "DATE", "DOMAIN", "ORGANIZATION", "POLICY",
-    }) catch return;
-    stdout_file.writeAll(header) catch {};
+    for (entries) |e| {
+        const hash_id = filenameToHashId(e.filename);
+        const type_str: []const u8 = switch (e.report_type) {
+            .dmarc => "DMARC",
+            .tlsrpt => "TLS-RPT",
+        };
+        w_id = @max(w_id, hash_id.len);
+        w_acct = @max(w_acct, e.account_name.len);
+        w_type = @max(w_type, type_str.len);
+        w_date = @max(w_date, e.date_begin.len);
+        w_domain = @max(w_domain, e.domain.len);
+        w_org = @max(w_org, e.org_name.len);
+        w_policy = @max(w_policy, e.policy.len);
+    }
 
-    const sep = std.fmt.bufPrint(&buf, "{s:-<16} {s:-<10} {s:-<8} {s:-<17} {s:-<20} {s:-<18} {s:-<10}\n", .{
-        "", "", "", "", "", "", "",
-    }) catch return;
-    stdout_file.writeAll(sep) catch {};
+    // Add 1 char padding
+    w_id += 1;
+    w_acct += 1;
+    w_type += 1;
+    w_date += 1;
+    w_domain += 1;
+    w_org += 1;
+    w_policy += 1;
+
+    try writeTableRow(allocator, &.{
+        .{ .val = "ID", .width = w_id },
+        .{ .val = "ACCOUNT", .width = w_acct },
+        .{ .val = "TYPE", .width = w_type },
+        .{ .val = "DATE", .width = w_date },
+        .{ .val = "DOMAIN", .width = w_domain },
+        .{ .val = "ORGANIZATION", .width = w_org },
+        .{ .val = "POLICY", .width = w_policy },
+    });
+    try writeSepRow(allocator, &.{ w_id, w_acct, w_type, w_date, w_domain, w_org, w_policy });
 
     for (entries) |e| {
         const type_str: []const u8 = switch (e.report_type) {
@@ -635,16 +667,15 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
             .tlsrpt => "TLS-RPT",
         };
         const hash_id = filenameToHashId(e.filename);
-        const line = std.fmt.bufPrint(&buf, "{s:<16} {s:<10} {s:<8} {s:<17} {s:<20} {s:<18} {s:<10}\n", .{
-            hash_id,
-            truncate(e.account_name, 9),
-            type_str,
-            truncate(e.date_begin, 16),
-            truncate(e.domain, 19),
-            truncate(e.org_name, 17),
-            truncate(e.policy, 9),
-        }) catch continue;
-        stdout_file.writeAll(line) catch {};
+        try writeTableRow(allocator, &.{
+            .{ .val = hash_id, .width = w_id },
+            .{ .val = e.account_name, .width = w_acct },
+            .{ .val = type_str, .width = w_type },
+            .{ .val = e.date_begin, .width = w_date },
+            .{ .val = e.domain, .width = w_domain },
+            .{ .val = e.org_name, .width = w_org },
+            .{ .val = e.policy, .width = w_policy },
+        });
     }
 }
 
@@ -666,14 +697,25 @@ fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.Re
     stdout_file.writeAll("\n]\n") catch {};
 }
 
-fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8) !void {
+const RowData = struct {
+    source_ip: []const u8,
+    count: u64,
+    disposition: []const u8,
+    from: []const u8,
+    dkim_eval: []const u8,
+    spf_eval: []const u8,
+    // enrichment (empty strings when disabled)
+    ptr_display: []const u8,
+    asn_display: []const u8,
+    flag: []const u8,
+};
+
+fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
     const parsed = try std.json.parseFromSlice(DmarcDetailJson, allocator, data, .{
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
     const r = parsed.value;
-
-    var buf: [512]u8 = undefined;
 
     for ([_]struct { label: []const u8, value: []const u8 }{
         .{ .label = "Organization: ", .value = r.metadata.org_name },
@@ -687,31 +729,312 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8) !void {
     }
     stdout_file.writeAll("\n") catch {};
 
-    const header = std.fmt.bufPrint(&buf, "{s:<16} {s:<6} {s:<12} {s:<25} {s:<25} {s:<6} {s:<6}\n", .{
-        "SOURCE IP", "COUNT", "DISPOSITION", "ENVELOPE FROM", "HEADER FROM", "DKIM", "SPF",
-    }) catch return;
-    stdout_file.writeAll(header) catch {};
+    // --- Pass 1: build row data and compute enrichment ---
+    var ip_cache = std.StringHashMap(CachedIpInfo).init(allocator);
+    defer {
+        var it = ip_cache.valueIterator();
+        while (it.next()) |v| v.deinit(allocator);
+        ip_cache.deinit();
+    }
 
-    const sep = std.fmt.bufPrint(&buf, "{s:-<16} {s:-<6} {s:-<12} {s:-<25} {s:-<25} {s:-<6} {s:-<6}\n", .{
-        "", "", "", "", "", "", "",
-    }) catch return;
-    stdout_file.writeAll(sep) catch {};
+    var rows: std.ArrayList(RowData) = .empty;
+    defer {
+        for (rows.items) |row| {
+            allocator.free(row.from);
+            allocator.free(row.ptr_display);
+            allocator.free(row.asn_display);
+            allocator.free(row.flag);
+        }
+        rows.deinit(allocator);
+    }
 
     for (r.records) |rec| {
-        const line = std.fmt.bufPrint(&buf, "{s:<16} {d:<6} {s:<12} {s:<25} {s:<25} {s:<6} {s:<6}\n", .{
-            truncate(rec.source_ip, 15),
-            rec.count,
-            truncate(rec.disposition, 11),
-            truncate(rec.envelope_from, 24),
-            truncate(rec.header_from, 24),
-            truncate(rec.dkim_eval, 5),
-            truncate(rec.spf_eval, 5),
-        }) catch continue;
-        stdout_file.writeAll(line) catch {};
+        const from = buildFromColumnAlloc(allocator, rec.header_from, rec.envelope_from) catch
+            try allocator.dupe(u8, rec.header_from);
+
+        var ptr_display: []const u8 = try allocator.dupe(u8, "");
+        var asn_display: []const u8 = try allocator.dupe(u8, "");
+        var flag: []const u8 = try allocator.dupe(u8, "");
+
+        if (enrich) {
+            const cached = lookupCached(allocator, &ip_cache, rec.source_ip);
+
+            allocator.free(ptr_display);
+            ptr_display = if (cached.ptr.len > 0 and !std.mem.eql(u8, cached.ptr, rec.source_ip))
+                try allocator.dupe(u8, cached.ptr)
+            else
+                try allocator.dupe(u8, "-");
+
+            allocator.free(asn_display);
+            asn_display = buildAsnColumn(allocator, cached) catch try allocator.dupe(u8, "-");
+
+            allocator.free(flag);
+            flag = countryFlag(allocator, cached.country) catch try allocator.dupe(u8, "-");
+        }
+
+        try rows.append(allocator, .{
+            .source_ip = rec.source_ip,
+            .count = rec.count,
+            .disposition = rec.disposition,
+            .from = from,
+            .dkim_eval = rec.dkim_eval,
+            .spf_eval = rec.spf_eval,
+            .ptr_display = ptr_display,
+            .asn_display = asn_display,
+            .flag = flag,
+        });
+    }
+
+    // --- Pass 2: compute column widths ---
+    var w_ip: usize = "SOURCE IP".len;
+    var w_ptr: usize = "PTR".len;
+    var w_asn: usize = "ASN".len;
+    var w_disp: usize = "DISP".len;
+    var w_from: usize = "FROM".len;
+
+    for (rows.items) |row| {
+        w_ip = @max(w_ip, row.source_ip.len);
+        w_disp = @max(w_disp, row.disposition.len);
+        w_from = @max(w_from, row.from.len);
+        if (enrich) {
+            w_ptr = @max(w_ptr, row.ptr_display.len);
+            w_asn = @max(w_asn, row.asn_display.len);
+        }
+    }
+
+    // Add 1 char padding so columns don't run together
+    w_ip += 1;
+    w_disp += 1;
+    w_from += 1;
+    if (enrich) {
+        w_ptr += 1;
+        w_asn += 1;
+    }
+
+    // --- Pass 3: output ---
+    // Fixed column widths (also +1 for padding)
+    const w_cc: usize = 3;
+    const w_count: usize = 6;
+    const w_dkim: usize = 5;
+    const w_spf: usize = 5;
+
+    if (enrich) {
+        try writeTableRow(allocator, &.{
+            .{ .val = "SOURCE IP", .width = w_ip },
+            .{ .val = "PTR", .width = w_ptr },
+            .{ .val = "ASN", .width = w_asn },
+            .{ .val = "CC", .width = w_cc },
+            .{ .val = "COUNT", .width = w_count },
+            .{ .val = "DISP", .width = w_disp },
+            .{ .val = "FROM", .width = w_from },
+            .{ .val = "DKIM", .width = w_dkim },
+            .{ .val = "SPF", .width = w_spf },
+        });
+        try writeSepRow(allocator, &.{ w_ip, w_ptr, w_asn, w_cc, w_count, w_disp, w_from, w_dkim, w_spf });
+    } else {
+        try writeTableRow(allocator, &.{
+            .{ .val = "SOURCE IP", .width = w_ip },
+            .{ .val = "COUNT", .width = w_count },
+            .{ .val = "DISP", .width = w_disp },
+            .{ .val = "FROM", .width = w_from },
+            .{ .val = "DKIM", .width = w_dkim },
+            .{ .val = "SPF", .width = w_spf },
+        });
+        try writeSepRow(allocator, &.{ w_ip, w_count, w_disp, w_from, w_dkim, w_spf });
+    }
+
+    for (rows.items) |row| {
+        var count_buf: [16]u8 = undefined;
+        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{row.count}) catch "0";
+
+        if (enrich) {
+            try writeTableRow(allocator, &.{
+                .{ .val = row.source_ip, .width = w_ip },
+                .{ .val = row.ptr_display, .width = w_ptr },
+                .{ .val = row.asn_display, .width = w_asn },
+                .{ .val = row.flag, .width = w_cc, .is_emoji = true },
+                .{ .val = count_str, .width = w_count },
+                .{ .val = row.disposition, .width = w_disp },
+                .{ .val = row.from, .width = w_from },
+                .{ .val = row.dkim_eval, .width = w_dkim },
+                .{ .val = row.spf_eval, .width = w_spf },
+            });
+        } else {
+            try writeTableRow(allocator, &.{
+                .{ .val = row.source_ip, .width = w_ip },
+                .{ .val = count_str, .width = w_count },
+                .{ .val = row.disposition, .width = w_disp },
+                .{ .val = row.from, .width = w_from },
+                .{ .val = row.dkim_eval, .width = w_dkim },
+                .{ .val = row.spf_eval, .width = w_spf },
+            });
+        }
     }
 }
 
-fn showTlsTable(allocator: std.mem.Allocator, data: []const u8) !void {
+const ColSpec = struct {
+    val: []const u8,
+    width: usize,
+    is_emoji: bool = false,
+};
+
+fn writeTableRow(allocator: std.mem.Allocator, cols: []const ColSpec) !void {
+    for (cols, 0..) |col, i| {
+        if (i > 0) stdout_file.writeAll(" ") catch {};
+
+        if (col.is_emoji) {
+            // Emoji: write full bytes, pad based on display width (not byte count)
+            stdout_file.writeAll(col.val) catch {};
+            const display_w = flagDisplayWidth(col.val);
+            if (display_w < col.width) {
+                const pad = allocator.alloc(u8, col.width - display_w) catch continue;
+                defer allocator.free(pad);
+                @memset(pad, ' ');
+                stdout_file.writeAll(pad) catch {};
+            }
+        } else {
+            // Normal text: truncate to column width, pad remainder
+            const text = truncate(col.val, col.width);
+            stdout_file.writeAll(text) catch {};
+            if (text.len < col.width) {
+                const pad = allocator.alloc(u8, col.width - text.len) catch continue;
+                defer allocator.free(pad);
+                @memset(pad, ' ');
+                stdout_file.writeAll(pad) catch {};
+            }
+        }
+    }
+    stdout_file.writeAll("\n") catch {};
+}
+
+fn writeSepRow(allocator: std.mem.Allocator, widths: []const usize) !void {
+    for (widths, 0..) |w, i| {
+        if (i > 0) stdout_file.writeAll(" ") catch {};
+        const sep = allocator.alloc(u8, w) catch continue;
+        defer allocator.free(sep);
+        @memset(sep, '-');
+        stdout_file.writeAll(sep) catch {};
+    }
+    stdout_file.writeAll("\n") catch {};
+}
+
+fn flagDisplayWidth(s: []const u8) usize {
+    // A single flag emoji (2 regional indicator symbols = 8 bytes) renders as ~2 chars wide.
+    // "-" is 1 byte / 1 char wide.
+    if (s.len == 0 or std.mem.eql(u8, s, "-")) return s.len;
+    if (s.len >= 8) return 2; // flag emoji
+    if (s.len >= 4) return 1; // single regional indicator (shouldn't happen)
+    return s.len;
+}
+
+const CachedIpInfo = struct {
+    ptr: []const u8,
+    asn: []const u8,
+    asn_org: []const u8,
+    country: []const u8,
+
+    fn deinit(self: *const CachedIpInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.ptr);
+        allocator.free(self.asn);
+        allocator.free(self.asn_org);
+        allocator.free(self.country);
+    }
+};
+
+fn lookupCached(allocator: std.mem.Allocator, cache: *std.StringHashMap(CachedIpInfo), ip: []const u8) *const CachedIpInfo {
+    if (cache.getPtr(ip)) |existing| return existing;
+
+    const info = reports.ipinfo.lookup(allocator, ip);
+    // Ownership of info's allocated fields transfers to the cache entry.
+    // On put failure, we must free them explicitly since info won't be deinit'd.
+    const entry = CachedIpInfo{
+        .ptr = info.ptr,
+        .asn = info.asn,
+        .asn_org = info.asn_org,
+        .country = info.country,
+    };
+    // The IP key comes from the parsed JSON data, which lives for the
+    // duration of the cache (same scope in showDmarcTable).
+    cache.put(ip, entry) catch {
+        // put failed — free the allocated strings that would have been owned by the cache
+        entry.deinit(allocator);
+        const S = struct {
+            const empty = CachedIpInfo{ .ptr = "", .asn = "", .asn_org = "", .country = "" };
+        };
+        return &S.empty;
+    };
+    return cache.getPtr(ip).?;
+}
+
+fn writeTlsEnrichLine(buf: *[512]u8, info: *const CachedIpInfo, source_ip: []const u8) void {
+    stdout_file.writeAll(dim) catch {};
+    stdout_file.writeAll("      \xe2\x86\x92 ") catch {}; // "      → "
+
+    if (info.ptr.len > 0 and !std.mem.eql(u8, info.ptr, source_ip)) {
+        stdout_file.writeAll(info.ptr) catch {};
+    } else {
+        stdout_file.writeAll("(no PTR)") catch {};
+    }
+
+    if (info.asn.len > 0) {
+        const asn_part = std.fmt.bufPrint(buf, " | AS{s}", .{info.asn}) catch "";
+        stdout_file.writeAll(asn_part) catch {};
+        if (info.asn_org.len > 0) {
+            stdout_file.writeAll(" ") catch {};
+            stdout_file.writeAll(info.asn_org) catch {};
+        }
+    }
+
+    if (info.country.len > 0) {
+        stdout_file.writeAll(" | ") catch {};
+        stdout_file.writeAll(info.country) catch {};
+    }
+
+    stdout_file.writeAll(reset) catch {};
+    stdout_file.writeAll("\n") catch {};
+}
+
+fn buildFromColumnAlloc(allocator: std.mem.Allocator, header_from: []const u8, envelope_from: []const u8) ![]const u8 {
+    if (envelope_from.len == 0 or std.mem.eql(u8, envelope_from, header_from)) {
+        return try allocator.dupe(u8, header_from);
+    }
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ header_from, envelope_from });
+}
+
+fn buildAsnColumn(allocator: std.mem.Allocator, info: *const CachedIpInfo) ![]const u8 {
+    if (info.asn.len == 0) return try allocator.dupe(u8, "-");
+    if (info.asn_org.len > 0) {
+        return std.fmt.allocPrint(allocator, "AS{s} {s}", .{ info.asn, info.asn_org });
+    }
+    return std.fmt.allocPrint(allocator, "AS{s}", .{info.asn});
+}
+
+/// Convert a 2-letter country code to a flag emoji (Regional Indicator Symbols).
+/// "US" → 🇺🇸 (U+1F1FA U+1F1F8), each code point is 4 bytes in UTF-8.
+fn countryFlag(allocator: std.mem.Allocator, cc: []const u8) ![]const u8 {
+    if (cc.len < 2) return try allocator.dupe(u8, "-");
+
+    const c0 = std.ascii.toUpper(cc[0]);
+    const c1 = std.ascii.toUpper(cc[1]);
+    if (c0 < 'A' or c0 > 'Z' or c1 < 'A' or c1 > 'Z') {
+        return try allocator.dupe(u8, "-");
+    }
+
+    // Regional Indicator Symbol Letter A = U+1F1E6
+    const ri0: u21 = 0x1F1E6 + @as(u21, c0 - 'A');
+    const ri1: u21 = 0x1F1E6 + @as(u21, c1 - 'A');
+
+    var buf0: [4]u8 = undefined;
+    var buf1: [4]u8 = undefined;
+    const len0: usize = std.unicode.utf8Encode(ri0, &buf0) catch return try allocator.dupe(u8, "-");
+    const len1: usize = std.unicode.utf8Encode(ri1, &buf1) catch return try allocator.dupe(u8, "-");
+    var result: [8]u8 = undefined;
+    @memcpy(result[0..len0], buf0[0..len0]);
+    @memcpy(result[len0 .. len0 + len1], buf1[0..len1]);
+    return try allocator.dupe(u8, result[0 .. len0 + len1]);
+}
+
+fn showTlsTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
     const parsed = try std.json.parseFromSlice(TlsDetailJson, allocator, data, .{
         .ignore_unknown_fields = true,
     });
@@ -743,6 +1066,18 @@ fn showTlsTable(allocator: std.mem.Allocator, data: []const u8) !void {
                     f.result_type, f.sending_mta_ip, f.receiving_mx_hostname, f.failed_session_count,
                 }) catch continue;
                 stdout_file.writeAll(fline) catch {};
+
+                if (enrich and f.sending_mta_ip.len > 0) {
+                    const info = reports.ipinfo.lookup(allocator, f.sending_mta_ip);
+                    defer info.deinit(allocator);
+                    const cached = CachedIpInfo{
+                        .ptr = info.ptr,
+                        .asn = info.asn,
+                        .asn_org = info.asn_org,
+                        .country = info.country,
+                    };
+                    writeTlsEnrichLine(&buf, &cached, f.sending_mta_ip);
+                }
             }
         }
     }
@@ -836,6 +1171,7 @@ fn printUsage() void {
         \\  --domain <domain>     Filter by domain
         \\  --type <dmarc|tlsrpt> Filter by report type
         \\  --period <week|month|year> Group summary by period
+        \\  --no-enrich            Disable IP enrichment (PTR/ASN/country)
         \\
         \\Configuration: ~/.config/reports/config.json
         \\
@@ -849,6 +1185,13 @@ fn getOption(args: []const []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn hasFlag(args: []const []const u8, name: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, name)) return true;
+    }
+    return false;
 }
 
 // --- Tests ---
@@ -953,4 +1296,51 @@ test "isTlsrptContentType" {
     try std.testing.expect(!isTlsrptContentType("application/gzip"));
     try std.testing.expect(!isTlsrptContentType("application/xml"));
     try std.testing.expect(!isTlsrptContentType("text/plain"));
+}
+
+test "countryFlag converts country code to flag emoji" {
+    const allocator = std.testing.allocator;
+
+    const us = try countryFlag(allocator, "US");
+    defer allocator.free(us);
+    try std.testing.expectEqualStrings("\xf0\x9f\x87\xba\xf0\x9f\x87\xb8", us); // 🇺🇸
+
+    const jp = try countryFlag(allocator, "JP");
+    defer allocator.free(jp);
+    try std.testing.expectEqualStrings("\xf0\x9f\x87\xaf\xf0\x9f\x87\xb5", jp); // 🇯🇵
+
+    // Lowercase should also work
+    const de = try countryFlag(allocator, "de");
+    defer allocator.free(de);
+    try std.testing.expectEqualStrings("\xf0\x9f\x87\xa9\xf0\x9f\x87\xaa", de); // 🇩🇪
+}
+
+test "countryFlag returns dash for invalid input" {
+    const allocator = std.testing.allocator;
+
+    const short = try countryFlag(allocator, "U");
+    defer allocator.free(short);
+    try std.testing.expectEqualStrings("-", short);
+
+    const empty = try countryFlag(allocator, "");
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("-", empty);
+}
+
+test "buildFromColumnAlloc merges header and envelope from" {
+    const allocator = std.testing.allocator;
+
+    // Same or empty envelope → just header
+    const same = try buildFromColumnAlloc(allocator, "example.com", "example.com");
+    defer allocator.free(same);
+    try std.testing.expectEqualStrings("example.com", same);
+
+    const empty_ef = try buildFromColumnAlloc(allocator, "example.com", "");
+    defer allocator.free(empty_ef);
+    try std.testing.expectEqualStrings("example.com", empty_ef);
+
+    // Different → "header/envelope"
+    const diff = try buildFromColumnAlloc(allocator, "example.com", "bounce.example.com");
+    defer allocator.free(diff);
+    try std.testing.expectEqualStrings("example.com/bounce.example.com", diff);
 }

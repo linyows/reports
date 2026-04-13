@@ -1,5 +1,13 @@
 import SwiftUI
 
+/// A DMARC record row enriched with IP info, used as the Table data source.
+struct EnrichedDmarcRecord: Identifiable {
+    let record: DmarcDetailRecord
+    let enrichment: IpEnrichment?
+
+    var id: String { record.id }
+}
+
 struct ReportDetailView: View {
     @EnvironmentObject var viewModel: ReportsViewModel
 
@@ -64,45 +72,67 @@ struct ReportDetailView: View {
             .font(.system(.body, design: .monospaced))
             .padding(.bottom, 12)
 
-            // Records table (matches CLI columns)
+            // Records table (matches CLI columns with IP enrichment)
             if !report.records.isEmpty {
-                Table(report.records) {
-                    TableColumn("SOURCE IP") { r in
-                        Text(r.source_ip).monospaced()
+                let enrichedRows = report.records.map { rec in
+                    EnrichedDmarcRecord(
+                        record: rec,
+                        enrichment: ReportsCore.shared.enrichIP(rec.source_ip)
+                    )
+                }
+                Table(enrichedRows) {
+                    TableColumn("SOURCE IP") { row in
+                        Text(row.record.source_ip).monospaced()
                     }
-                    .width(min: 100, ideal: 140)
+                    .width(min: 100, ideal: 130)
 
-                    TableColumn("COUNT") { r in
-                        Text("\(r.count)").monospaced()
+                    TableColumn("PTR") { row in
+                        let display = row.enrichment?.ptrDisplay(sourceIP: row.record.source_ip) ?? "-"
+                        Text(display)
+                            .monospaced().lineLimit(1)
+                            .foregroundStyle(display == "-" ? .secondary : .primary)
+                    }
+                    .width(min: 80, ideal: 180)
+
+                    TableColumn("ASN") { row in
+                        let display = row.enrichment?.asnDisplay ?? "-"
+                        Text(display)
+                            .monospaced().lineLimit(1)
+                            .foregroundStyle(display == "-" ? .secondary : .primary)
+                    }
+                    .width(min: 80, ideal: 200)
+
+                    TableColumn("CC") { row in
+                        Text(row.enrichment?.countryFlag ?? "-")
+                    }
+                    .width(min: 30, ideal: 35)
+
+                    TableColumn("COUNT") { row in
+                        Text("\(row.record.count)").monospaced()
                     }
                     .width(min: 40, ideal: 55)
 
-                    TableColumn("DISPOSITION") { r in
-                        Text(r.disposition).monospaced()
+                    TableColumn("DISP") { row in
+                        Text(row.record.disposition).monospaced()
                     }
-                    .width(min: 60, ideal: 100)
+                    .width(min: 50, ideal: 80)
 
-                    TableColumn("ENVELOPE FROM") { r in
-                        Text(r.envelope_from).monospaced().lineLimit(1)
+                    TableColumn("FROM") { row in
+                        Text(row.record.from).monospaced().lineLimit(1)
                     }
-                    .width(min: 80, ideal: 160)
+                    .width(min: 80, ideal: 180)
 
-                    TableColumn("HEADER FROM") { r in
-                        Text(r.header_from).monospaced().lineLimit(1)
-                    }
-                    .width(min: 80, ideal: 160)
-
-                    TableColumn("DKIM") { r in
-                        Text(r.dkim_eval)
+                    TableColumn("DKIM") { row in
+                        Text(row.record.dkim_eval)
                             .monospaced()
-                            .foregroundStyle(r.dkim_eval == "pass" ? .green : .red)
+                            .foregroundStyle(row.record.dkim_eval == "pass" ? .green : .red)
                     }
                     .width(min: 40, ideal: 50)
 
-                    TableColumn("SPF") { r in
-                        Text(r.spf_eval)
+                    TableColumn("SPF") { row in
+                        Text(row.record.spf_eval)
                             .monospaced()
-                            .foregroundStyle(r.spf_eval == "pass" ? .green : .red)
+                            .foregroundStyle(row.record.spf_eval == "pass" ? .green : .red)
                     }
                     .width(min: 40, ideal: 50)
                 }
@@ -205,7 +235,22 @@ struct ReportDetailView: View {
                             TableColumn("SENDING MTA IP") { f in
                                 Text(f.sending_mta_ip).monospaced()
                             }
-                            .width(min: 80, ideal: 140)
+                            .width(min: 80, ideal: 130)
+
+                            TableColumn("PTR") { f in
+                                let info = ReportsCore.shared.enrichIP(f.sending_mta_ip)
+                                Text(info?.ptrDisplay(sourceIP: f.sending_mta_ip) ?? "-")
+                                    .monospaced().lineLimit(1)
+                                    .foregroundStyle(info?.ptr.isEmpty ?? true ? .secondary : .primary)
+                            }
+                            .width(min: 80, ideal: 160)
+
+                            TableColumn("ASN") { f in
+                                let info = ReportsCore.shared.enrichIP(f.sending_mta_ip)
+                                Text(info?.asnDisplay ?? "-")
+                                    .monospaced().lineLimit(1)
+                            }
+                            .width(min: 80, ideal: 160)
 
                             TableColumn("RECEIVING MX") { f in
                                 Text(f.receiving_mx_hostname).monospaced()

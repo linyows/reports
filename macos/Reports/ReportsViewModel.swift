@@ -90,6 +90,7 @@ final class ReportsViewModel: ObservableObject {
     func loadDetail(for entry: ReportEntry) {
         selectedEntryID = entry.id
         detailJSON = nil
+        core.clearEnrichCache()
         do {
             detailJSON = try core.show(type: entry.type, account: entry.account, filename: entry.filename)
         } catch {
