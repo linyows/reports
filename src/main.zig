@@ -34,7 +34,7 @@ pub fn main() !void {
     const domain = getOption(args, "--domain");
     const period = getOption(args, "--period");
     const report_type = getOption(args, "--type");
-    const enrich = hasFlag(args, "--enrich");
+    const enrich = !hasFlag(args, "--no-enrich");
 
     if (std.mem.eql(u8, command, "fetch")) {
         try cmdFetch(allocator, account);
@@ -930,7 +930,7 @@ fn printUsage() void {
         \\  --domain <domain>     Filter by domain
         \\  --type <dmarc|tlsrpt> Filter by report type
         \\  --period <week|month|year> Group summary by period
-        \\  --enrich               Enrich IPs with PTR/ASN/country (show command)
+        \\  --no-enrich            Disable IP enrichment (PTR/ASN/country)
         \\
         \\Configuration: ~/.config/reports/config.json
         \\
