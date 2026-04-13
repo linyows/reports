@@ -34,6 +34,7 @@ pub fn main() !void {
     const domain = getOption(args, "--domain");
     const period = getOption(args, "--period");
     const report_type = getOption(args, "--type");
+    const enrich = hasFlag(args, "--enrich");
 
     if (std.mem.eql(u8, command, "fetch")) {
         try cmdFetch(allocator, account);
@@ -44,7 +45,7 @@ pub fn main() !void {
             stderr_file.writeAll("Usage: reports show <report-id>\n") catch {};
             return;
         }
-        try cmdShow(allocator, args[2], format orelse "table");
+        try cmdShow(allocator, args[2], format orelse "table", enrich);
     } else if (std.mem.eql(u8, command, "domains")) {
         try cmdDomains(allocator, format orelse "table", account);
     } else if (std.mem.eql(u8, command, "summary")) {
@@ -269,7 +270,7 @@ fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8
     }
 }
 
-fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const u8) !void {
+fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const u8, enrich: bool) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
 
@@ -292,7 +293,7 @@ fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const 
                         stdout_file.writeAll(data) catch {};
                         stdout_file.writeAll("\n") catch {};
                     } else {
-                        try showDmarcTable(allocator, data);
+                        try showDmarcTable(allocator, data, enrich);
                     }
                 },
                 .tlsrpt => {
@@ -303,7 +304,7 @@ fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const 
                         stdout_file.writeAll(data) catch {};
                         stdout_file.writeAll("\n") catch {};
                     } else {
-                        try showTlsTable(allocator, data);
+                        try showTlsTable(allocator, data, enrich);
                     }
                 },
             }
@@ -666,7 +667,7 @@ fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.Re
     stdout_file.writeAll("\n]\n") catch {};
 }
 
-fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8) !void {
+fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
     const parsed = try std.json.parseFromSlice(DmarcDetailJson, allocator, data, .{
         .ignore_unknown_fields = true,
     });
@@ -697,6 +698,14 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8) !void {
     }) catch return;
     stdout_file.writeAll(sep) catch {};
 
+    // Cache enrichment results to avoid duplicate DNS lookups
+    var ip_cache = std.StringHashMap(CachedIpInfo).init(allocator);
+    defer {
+        var it = ip_cache.valueIterator();
+        while (it.next()) |v| v.deinit(allocator);
+        ip_cache.deinit();
+    }
+
     for (r.records) |rec| {
         const line = std.fmt.bufPrint(&buf, "{s:<16} {d:<6} {s:<12} {s:<25} {s:<25} {s:<6} {s:<6}\n", .{
             truncate(rec.source_ip, 15),
@@ -708,10 +717,82 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8) !void {
             truncate(rec.spf_eval, 5),
         }) catch continue;
         stdout_file.writeAll(line) catch {};
+
+        if (enrich) {
+            const cached = lookupCached(allocator, &ip_cache, rec.source_ip);
+            writeEnrichLine(&buf, cached, rec.source_ip);
+        }
     }
 }
 
-fn showTlsTable(allocator: std.mem.Allocator, data: []const u8) !void {
+const CachedIpInfo = struct {
+    ptr: []const u8,
+    asn: []const u8,
+    asn_org: []const u8,
+    country: []const u8,
+
+    fn deinit(self: *const CachedIpInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.ptr);
+        allocator.free(self.asn);
+        allocator.free(self.asn_org);
+        allocator.free(self.country);
+    }
+};
+
+fn lookupCached(allocator: std.mem.Allocator, cache: *std.StringHashMap(CachedIpInfo), ip: []const u8) *const CachedIpInfo {
+    if (cache.getPtr(ip)) |existing| return existing;
+
+    const info = reports.ipinfo.lookup(allocator, ip);
+    // Ownership of info's allocated fields transfers to the cache entry.
+    // On put failure, we must free them explicitly since info won't be deinit'd.
+    const entry = CachedIpInfo{
+        .ptr = info.ptr,
+        .asn = info.asn,
+        .asn_org = info.asn_org,
+        .country = info.country,
+    };
+    // The IP key comes from the parsed JSON data, which lives for the
+    // duration of the cache (same scope in showDmarcTable).
+    cache.put(ip, entry) catch {
+        // put failed — free the allocated strings that would have been owned by the cache
+        entry.deinit(allocator);
+        const S = struct {
+            const empty = CachedIpInfo{ .ptr = "", .asn = "", .asn_org = "", .country = "" };
+        };
+        return &S.empty;
+    };
+    return cache.getPtr(ip).?;
+}
+
+fn writeEnrichLine(buf: *[512]u8, info: *const CachedIpInfo, source_ip: []const u8) void {
+    stdout_file.writeAll(dim) catch {};
+    stdout_file.writeAll("  \xe2\x86\x92 ") catch {}; // " → " (UTF-8 arrow)
+
+    if (info.ptr.len > 0 and !std.mem.eql(u8, info.ptr, source_ip)) {
+        stdout_file.writeAll(info.ptr) catch {};
+    } else {
+        stdout_file.writeAll("(no PTR)") catch {};
+    }
+
+    if (info.asn.len > 0) {
+        const asn_part = std.fmt.bufPrint(buf, " | AS{s}", .{info.asn}) catch "";
+        stdout_file.writeAll(asn_part) catch {};
+        if (info.asn_org.len > 0) {
+            stdout_file.writeAll(" ") catch {};
+            stdout_file.writeAll(info.asn_org) catch {};
+        }
+    }
+
+    if (info.country.len > 0) {
+        stdout_file.writeAll(" | ") catch {};
+        stdout_file.writeAll(info.country) catch {};
+    }
+
+    stdout_file.writeAll(reset) catch {};
+    stdout_file.writeAll("\n") catch {};
+}
+
+fn showTlsTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
     const parsed = try std.json.parseFromSlice(TlsDetailJson, allocator, data, .{
         .ignore_unknown_fields = true,
     });
@@ -743,6 +824,19 @@ fn showTlsTable(allocator: std.mem.Allocator, data: []const u8) !void {
                     f.result_type, f.sending_mta_ip, f.receiving_mx_hostname, f.failed_session_count,
                 }) catch continue;
                 stdout_file.writeAll(fline) catch {};
+
+                if (enrich and f.sending_mta_ip.len > 0) {
+                    const info = reports.ipinfo.lookup(allocator, f.sending_mta_ip);
+                    defer info.deinit(allocator);
+                    const cached = CachedIpInfo{
+                        .ptr = info.ptr,
+                        .asn = info.asn,
+                        .asn_org = info.asn_org,
+                        .country = info.country,
+                    };
+                    stdout_file.writeAll("    ") catch {};
+                    writeEnrichLine(&buf, &cached, f.sending_mta_ip);
+                }
             }
         }
     }
@@ -836,6 +930,7 @@ fn printUsage() void {
         \\  --domain <domain>     Filter by domain
         \\  --type <dmarc|tlsrpt> Filter by report type
         \\  --period <week|month|year> Group summary by period
+        \\  --enrich               Enrich IPs with PTR/ASN/country (show command)
         \\
         \\Configuration: ~/.config/reports/config.json
         \\
@@ -849,6 +944,13 @@ fn getOption(args: []const []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn hasFlag(args: []const []const u8, name: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, name)) return true;
+    }
+    return false;
 }
 
 // --- Tests ---

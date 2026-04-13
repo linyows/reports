@@ -32,7 +32,12 @@ char *reports_list(const char *config_json);
 char *reports_show(const char *config_json, const char *report_type,
                    const char *account_name, const char *filename);
 
-/// Free a string returned by reports_list or reports_show.
+/// Enrich an IP address with PTR, ASN, organization, and country info.
+/// @param ip The IP address string (IPv4 or IPv6).
+/// @return JSON string, or NULL on error. Free with reports_free_string().
+char *reports_enrich_ip(const char *ip);
+
+/// Free a string returned by reports_list, reports_show, or reports_enrich_ip.
 void reports_free_string(char *ptr);
 
 #ifdef __cplusplus

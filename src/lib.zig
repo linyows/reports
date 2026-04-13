@@ -145,6 +145,18 @@ fn filenameToHashId(filename: []const u8) []const u8 {
     return filename;
 }
 
+export fn reports_enrich_ip(ip: [*:0]const u8) ?[*:0]u8 {
+    const ip_span = std.mem.span(ip);
+    const info = reports.ipinfo.lookup(allocator, ip_span);
+    defer info.deinit(allocator);
+
+    const json = info.toJson(allocator) catch return null;
+    defer allocator.free(json);
+
+    const result = allocator.dupeZ(u8, json) catch return null;
+    return result.ptr;
+}
+
 export fn reports_free_string(ptr: ?[*:0]u8) void {
     if (ptr) |p| {
         const len = std.mem.len(p);
