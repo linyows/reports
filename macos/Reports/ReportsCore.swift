@@ -62,6 +62,24 @@ final class ReportsCore: @unchecked Sendable {
         defer { reports_free_string(ptr) }
         return String(cString: ptr)
     }
+    private var enrichCache: [String: IpEnrichment] = [:]
+
+    /// Enrich an IP address with PTR, ASN, org, and country info (cached).
+    func enrichIP(_ ip: String) -> IpEnrichment? {
+        if let cached = enrichCache[ip] { return cached }
+        guard let ptr = reports_enrich_ip(ip) else { return nil }
+        defer { reports_free_string(ptr) }
+        let json = String(cString: ptr)
+        guard let data = json.data(using: .utf8) else { return nil }
+        guard let result = try? JSONDecoder().decode(IpEnrichment.self, from: data) else { return nil }
+        enrichCache[ip] = result
+        return result
+    }
+
+    /// Clear enrichment cache (e.g., when switching reports).
+    func clearEnrichCache() {
+        enrichCache.removeAll()
+    }
 }
 
 enum ReportsError: LocalizedError {

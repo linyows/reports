@@ -131,6 +131,14 @@ struct DmarcDetailRecord: Codable, Identifiable {
 
     var id: String { "\(source_ip)-\(header_from)-\(count)" }
 
+    /// Merged FROM: "header_from/envelope_from" when they differ, otherwise just header_from.
+    var from: String {
+        if envelope_from.isEmpty || envelope_from == header_from {
+            return header_from
+        }
+        return "\(header_from)/\(envelope_from)"
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         source_ip = try container.decodeIfPresent(String.self, forKey: .source_ip) ?? ""
@@ -209,5 +217,41 @@ struct TlsDetailFailure: Codable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case result_type, sending_mta_ip, receiving_mx_hostname, failed_session_count
+    }
+}
+
+// MARK: - IP Enrichment
+
+struct IpEnrichment: Codable {
+    let ptr: String
+    let asn: String
+    let asn_org: String
+    let country: String
+
+    /// Display PTR, or "-" if empty or same as source IP.
+    func ptrDisplay(sourceIP: String) -> String {
+        if ptr.isEmpty || ptr == sourceIP { return "-" }
+        return ptr
+    }
+
+    /// "AS15169 Google LLC" or "-".
+    var asnDisplay: String {
+        if asn.isEmpty { return "-" }
+        if asn_org.isEmpty { return "AS\(asn)" }
+        return "AS\(asn) \(asn_org)"
+    }
+
+    /// Country code as flag emoji, e.g. "US" → "🇺🇸".
+    var countryFlag: String {
+        guard country.count >= 2 else { return "-" }
+        let base: UInt32 = 0x1F1E6
+        let upper = country.uppercased()
+        let scalars = upper.prefix(2).unicodeScalars.compactMap { scalar -> Unicode.Scalar? in
+            let offset = scalar.value - 0x41 // 'A'
+            guard offset < 26 else { return nil }
+            return Unicode.Scalar(base + offset)
+        }
+        guard scalars.count == 2 else { return "-" }
+        return String(scalars.map { Character($0) })
     }
 }
