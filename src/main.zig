@@ -667,14 +667,25 @@ fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.Re
     stdout_file.writeAll("\n]\n") catch {};
 }
 
+const RowData = struct {
+    source_ip: []const u8,
+    count: u64,
+    disposition: []const u8,
+    from: []const u8,
+    dkim_eval: []const u8,
+    spf_eval: []const u8,
+    // enrichment (empty strings when disabled)
+    ptr_display: []const u8,
+    asn_display: []const u8,
+    flag: []const u8,
+};
+
 fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
     const parsed = try std.json.parseFromSlice(DmarcDetailJson, allocator, data, .{
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
     const r = parsed.value;
-
-    var buf: [512]u8 = undefined;
 
     for ([_]struct { label: []const u8, value: []const u8 }{
         .{ .label = "Organization: ", .value = r.metadata.org_name },
@@ -688,17 +699,7 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
     }
     stdout_file.writeAll("\n") catch {};
 
-    const header = std.fmt.bufPrint(&buf, "{s:<16} {s:<6} {s:<12} {s:<25} {s:<25} {s:<6} {s:<6}\n", .{
-        "SOURCE IP", "COUNT", "DISPOSITION", "ENVELOPE FROM", "HEADER FROM", "DKIM", "SPF",
-    }) catch return;
-    stdout_file.writeAll(header) catch {};
-
-    const sep = std.fmt.bufPrint(&buf, "{s:-<16} {s:-<6} {s:-<12} {s:-<25} {s:-<25} {s:-<6} {s:-<6}\n", .{
-        "", "", "", "", "", "", "",
-    }) catch return;
-    stdout_file.writeAll(sep) catch {};
-
-    // Cache enrichment results to avoid duplicate DNS lookups
+    // --- Pass 1: build row data and compute enrichment ---
     var ip_cache = std.StringHashMap(CachedIpInfo).init(allocator);
     defer {
         var it = ip_cache.valueIterator();
@@ -706,23 +707,168 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
         ip_cache.deinit();
     }
 
+    var rows: std.ArrayList(RowData) = .empty;
+    defer {
+        for (rows.items) |row| {
+            allocator.free(row.from);
+            allocator.free(row.ptr_display);
+            allocator.free(row.asn_display);
+            allocator.free(row.flag);
+        }
+        rows.deinit(allocator);
+    }
+
     for (r.records) |rec| {
-        const line = std.fmt.bufPrint(&buf, "{s:<16} {d:<6} {s:<12} {s:<25} {s:<25} {s:<6} {s:<6}\n", .{
-            truncate(rec.source_ip, 15),
-            rec.count,
-            truncate(rec.disposition, 11),
-            truncate(rec.envelope_from, 24),
-            truncate(rec.header_from, 24),
-            truncate(rec.dkim_eval, 5),
-            truncate(rec.spf_eval, 5),
-        }) catch continue;
-        stdout_file.writeAll(line) catch {};
+        const from = buildFromColumnAlloc(allocator, rec.header_from, rec.envelope_from) catch
+            try allocator.dupe(u8, rec.header_from);
+
+        var ptr_display: []const u8 = try allocator.dupe(u8, "");
+        var asn_display: []const u8 = try allocator.dupe(u8, "");
+        var flag: []const u8 = try allocator.dupe(u8, "");
 
         if (enrich) {
             const cached = lookupCached(allocator, &ip_cache, rec.source_ip);
-            writeEnrichLine(&buf, cached, rec.source_ip);
+
+            allocator.free(ptr_display);
+            ptr_display = if (cached.ptr.len > 0 and !std.mem.eql(u8, cached.ptr, rec.source_ip))
+                try allocator.dupe(u8, cached.ptr)
+            else
+                try allocator.dupe(u8, "-");
+
+            allocator.free(asn_display);
+            asn_display = buildAsnColumn(allocator, cached) catch try allocator.dupe(u8, "-");
+
+            allocator.free(flag);
+            flag = countryFlag(allocator, cached.country) catch try allocator.dupe(u8, "-");
+        }
+
+        try rows.append(allocator, .{
+            .source_ip = rec.source_ip,
+            .count = rec.count,
+            .disposition = rec.disposition,
+            .from = from,
+            .dkim_eval = rec.dkim_eval,
+            .spf_eval = rec.spf_eval,
+            .ptr_display = ptr_display,
+            .asn_display = asn_display,
+            .flag = flag,
+        });
+    }
+
+    // --- Pass 2: compute column widths ---
+    var w_ip: usize = "SOURCE IP".len;
+    var w_ptr: usize = "PTR".len;
+    var w_asn: usize = "ASN".len;
+    var w_disp: usize = "DISP".len;
+    var w_from: usize = "FROM".len;
+
+    for (rows.items) |row| {
+        w_ip = @max(w_ip, row.source_ip.len);
+        w_disp = @max(w_disp, row.disposition.len);
+        w_from = @max(w_from, row.from.len);
+        if (enrich) {
+            w_ptr = @max(w_ptr, row.ptr_display.len);
+            w_asn = @max(w_asn, row.asn_display.len);
         }
     }
+
+    // --- Pass 3: output ---
+    if (enrich) {
+        // Flag emoji is 4 bytes but renders as ~2 chars wide; header uses 2-char label
+        try writeTableRow(allocator, &.{
+            .{ .val = "SOURCE IP", .width = w_ip },
+            .{ .val = "PTR", .width = w_ptr },
+            .{ .val = "ASN", .width = w_asn },
+            .{ .val = "\xf0\x9f\x8f\xb3", .width = 2 }, // 🏳 (flag placeholder in header)
+            .{ .val = "COUNT", .width = 5 },
+            .{ .val = "DISP", .width = w_disp },
+            .{ .val = "FROM", .width = w_from },
+            .{ .val = "DKIM", .width = 4 },
+            .{ .val = "SPF", .width = 4 },
+        });
+        try writeSepRow(allocator, &.{ w_ip, w_ptr, w_asn, 2, 5, w_disp, w_from, 4, 4 });
+    } else {
+        try writeTableRow(allocator, &.{
+            .{ .val = "SOURCE IP", .width = w_ip },
+            .{ .val = "COUNT", .width = 5 },
+            .{ .val = "DISP", .width = w_disp },
+            .{ .val = "FROM", .width = w_from },
+            .{ .val = "DKIM", .width = 4 },
+            .{ .val = "SPF", .width = 4 },
+        });
+        try writeSepRow(allocator, &.{ w_ip, 5, w_disp, w_from, 4, 4 });
+    }
+
+    for (rows.items) |row| {
+        var count_buf: [16]u8 = undefined;
+        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{row.count}) catch "0";
+
+        if (enrich) {
+            try writeTableRow(allocator, &.{
+                .{ .val = row.source_ip, .width = w_ip },
+                .{ .val = row.ptr_display, .width = w_ptr },
+                .{ .val = row.asn_display, .width = w_asn },
+                .{ .val = row.flag, .width = 2, .is_emoji = true },
+                .{ .val = count_str, .width = 5 },
+                .{ .val = row.disposition, .width = w_disp },
+                .{ .val = row.from, .width = w_from },
+                .{ .val = row.dkim_eval, .width = 4 },
+                .{ .val = row.spf_eval, .width = 4 },
+            });
+        } else {
+            try writeTableRow(allocator, &.{
+                .{ .val = row.source_ip, .width = w_ip },
+                .{ .val = count_str, .width = 5 },
+                .{ .val = row.disposition, .width = w_disp },
+                .{ .val = row.from, .width = w_from },
+                .{ .val = row.dkim_eval, .width = 4 },
+                .{ .val = row.spf_eval, .width = 4 },
+            });
+        }
+    }
+}
+
+const ColSpec = struct {
+    val: []const u8,
+    width: usize,
+    is_emoji: bool = false,
+};
+
+fn writeTableRow(allocator: std.mem.Allocator, cols: []const ColSpec) !void {
+    for (cols, 0..) |col, i| {
+        if (i > 0) stdout_file.writeAll(" ") catch {};
+        stdout_file.writeAll(truncate(col.val, if (col.is_emoji) col.val.len else col.width)) catch {};
+
+        // Pad: emoji bytes are longer than display width, so use display_width for padding
+        const display_len = if (col.is_emoji) flagDisplayWidth(col.val) else truncate(col.val, col.width).len;
+        if (display_len < col.width) {
+            const pad = allocator.alloc(u8, col.width - display_len) catch continue;
+            defer allocator.free(pad);
+            @memset(pad, ' ');
+            stdout_file.writeAll(pad) catch {};
+        }
+    }
+    stdout_file.writeAll("\n") catch {};
+}
+
+fn writeSepRow(allocator: std.mem.Allocator, widths: []const usize) !void {
+    for (widths, 0..) |w, i| {
+        if (i > 0) stdout_file.writeAll(" ") catch {};
+        const sep = allocator.alloc(u8, w) catch continue;
+        defer allocator.free(sep);
+        @memset(sep, '-');
+        stdout_file.writeAll(sep) catch {};
+    }
+    stdout_file.writeAll("\n") catch {};
+}
+
+fn flagDisplayWidth(s: []const u8) usize {
+    // A single flag emoji (2 regional indicator symbols = 8 bytes) renders as ~2 chars wide.
+    // "-" is 1 byte / 1 char wide.
+    if (s.len == 0 or std.mem.eql(u8, s, "-")) return s.len;
+    if (s.len >= 8) return 2; // flag emoji
+    if (s.len >= 4) return 1; // single regional indicator (shouldn't happen)
+    return s.len;
 }
 
 const CachedIpInfo = struct {
@@ -764,9 +910,9 @@ fn lookupCached(allocator: std.mem.Allocator, cache: *std.StringHashMap(CachedIp
     return cache.getPtr(ip).?;
 }
 
-fn writeEnrichLine(buf: *[512]u8, info: *const CachedIpInfo, source_ip: []const u8) void {
+fn writeTlsEnrichLine(buf: *[512]u8, info: *const CachedIpInfo, source_ip: []const u8) void {
     stdout_file.writeAll(dim) catch {};
-    stdout_file.writeAll("  \xe2\x86\x92 ") catch {}; // " → " (UTF-8 arrow)
+    stdout_file.writeAll("      \xe2\x86\x92 ") catch {}; // "      → "
 
     if (info.ptr.len > 0 and !std.mem.eql(u8, info.ptr, source_ip)) {
         stdout_file.writeAll(info.ptr) catch {};
@@ -790,6 +936,42 @@ fn writeEnrichLine(buf: *[512]u8, info: *const CachedIpInfo, source_ip: []const 
 
     stdout_file.writeAll(reset) catch {};
     stdout_file.writeAll("\n") catch {};
+}
+
+fn buildFromColumnAlloc(allocator: std.mem.Allocator, header_from: []const u8, envelope_from: []const u8) ![]const u8 {
+    if (envelope_from.len == 0 or std.mem.eql(u8, envelope_from, header_from)) {
+        return try allocator.dupe(u8, header_from);
+    }
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ header_from, envelope_from });
+}
+
+fn buildAsnColumn(allocator: std.mem.Allocator, info: *const CachedIpInfo) ![]const u8 {
+    if (info.asn.len == 0) return try allocator.dupe(u8, "-");
+    if (info.asn_org.len > 0) {
+        return std.fmt.allocPrint(allocator, "AS{s} {s}", .{ info.asn, info.asn_org });
+    }
+    return std.fmt.allocPrint(allocator, "AS{s}", .{info.asn});
+}
+
+/// Convert a 2-letter country code to a flag emoji (Regional Indicator Symbols).
+/// "US" → 🇺🇸 (U+1F1FA U+1F1F8), each code point is 4 bytes in UTF-8.
+fn countryFlag(allocator: std.mem.Allocator, cc: []const u8) ![]const u8 {
+    if (cc.len < 2) return try allocator.dupe(u8, "-");
+
+    const c0 = std.ascii.toUpper(cc[0]);
+    const c1 = std.ascii.toUpper(cc[1]);
+    if (c0 < 'A' or c0 > 'Z' or c1 < 'A' or c1 > 'Z') {
+        return try allocator.dupe(u8, "-");
+    }
+
+    // Regional Indicator Symbol Letter A = U+1F1E6
+    const ri0: u21 = 0x1F1E6 + @as(u21, c0 - 'A');
+    const ri1: u21 = 0x1F1E6 + @as(u21, c1 - 'A');
+
+    var buf: [8]u8 = undefined;
+    const len0: usize = std.unicode.utf8Encode(ri0, buf[0..4]) catch return try allocator.dupe(u8, "-");
+    const len1: usize = std.unicode.utf8Encode(ri1, buf[len0 .. len0 + 4][0..4]) catch return try allocator.dupe(u8, "-");
+    return try allocator.dupe(u8, buf[0 .. len0 + len1]);
 }
 
 fn showTlsTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
@@ -834,8 +1016,7 @@ fn showTlsTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !v
                         .asn_org = info.asn_org,
                         .country = info.country,
                     };
-                    stdout_file.writeAll("    ") catch {};
-                    writeEnrichLine(&buf, &cached, f.sending_mta_ip);
+                    writeTlsEnrichLine(&buf, &cached, f.sending_mta_ip);
                 }
             }
         }
@@ -1055,4 +1236,51 @@ test "isTlsrptContentType" {
     try std.testing.expect(!isTlsrptContentType("application/gzip"));
     try std.testing.expect(!isTlsrptContentType("application/xml"));
     try std.testing.expect(!isTlsrptContentType("text/plain"));
+}
+
+test "countryFlag converts country code to flag emoji" {
+    const allocator = std.testing.allocator;
+
+    const us = try countryFlag(allocator, "US");
+    defer allocator.free(us);
+    try std.testing.expectEqualStrings("\xf0\x9f\x87\xba\xf0\x9f\x87\xb8", us); // 🇺🇸
+
+    const jp = try countryFlag(allocator, "JP");
+    defer allocator.free(jp);
+    try std.testing.expectEqualStrings("\xf0\x9f\x87\xaf\xf0\x9f\x87\xb5", jp); // 🇯🇵
+
+    // Lowercase should also work
+    const de = try countryFlag(allocator, "de");
+    defer allocator.free(de);
+    try std.testing.expectEqualStrings("\xf0\x9f\x87\xa9\xf0\x9f\x87\xaa", de); // 🇩🇪
+}
+
+test "countryFlag returns dash for invalid input" {
+    const allocator = std.testing.allocator;
+
+    const short = try countryFlag(allocator, "U");
+    defer allocator.free(short);
+    try std.testing.expectEqualStrings("-", short);
+
+    const empty = try countryFlag(allocator, "");
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("-", empty);
+}
+
+test "buildFromColumnAlloc merges header and envelope from" {
+    const allocator = std.testing.allocator;
+
+    // Same or empty envelope → just header
+    const same = try buildFromColumnAlloc(allocator, "example.com", "example.com");
+    defer allocator.free(same);
+    try std.testing.expectEqualStrings("example.com", same);
+
+    const empty_ef = try buildFromColumnAlloc(allocator, "example.com", "");
+    defer allocator.free(empty_ef);
+    try std.testing.expectEqualStrings("example.com", empty_ef);
+
+    // Different → "header/envelope"
+    const diff = try buildFromColumnAlloc(allocator, "example.com", "bounce.example.com");
+    defer allocator.free(diff);
+    try std.testing.expectEqualStrings("example.com/bounce.example.com", diff);
 }
