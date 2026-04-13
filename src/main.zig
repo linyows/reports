@@ -617,18 +617,49 @@ const DmarcStatsJson = struct {
 };
 
 fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.ReportEntry) !void {
-    _ = allocator;
-    var buf: [512]u8 = undefined;
+    // Compute dynamic column widths from data
+    var w_id: usize = "ID".len;
+    var w_acct: usize = "ACCOUNT".len;
+    var w_type: usize = "TYPE".len;
+    var w_date: usize = "DATE".len;
+    var w_domain: usize = "DOMAIN".len;
+    var w_org: usize = "ORGANIZATION".len;
+    var w_policy: usize = "POLICY".len;
 
-    const header = std.fmt.bufPrint(&buf, "{s:<16} {s:<10} {s:<8} {s:<17} {s:<20} {s:<18} {s:<10}\n", .{
-        "ID", "ACCOUNT", "TYPE", "DATE", "DOMAIN", "ORGANIZATION", "POLICY",
-    }) catch return;
-    stdout_file.writeAll(header) catch {};
+    for (entries) |e| {
+        const hash_id = filenameToHashId(e.filename);
+        const type_str: []const u8 = switch (e.report_type) {
+            .dmarc => "DMARC",
+            .tlsrpt => "TLS-RPT",
+        };
+        w_id = @max(w_id, hash_id.len);
+        w_acct = @max(w_acct, e.account_name.len);
+        w_type = @max(w_type, type_str.len);
+        w_date = @max(w_date, e.date_begin.len);
+        w_domain = @max(w_domain, e.domain.len);
+        w_org = @max(w_org, e.org_name.len);
+        w_policy = @max(w_policy, e.policy.len);
+    }
 
-    const sep = std.fmt.bufPrint(&buf, "{s:-<16} {s:-<10} {s:-<8} {s:-<17} {s:-<20} {s:-<18} {s:-<10}\n", .{
-        "", "", "", "", "", "", "",
-    }) catch return;
-    stdout_file.writeAll(sep) catch {};
+    // Add 1 char padding
+    w_id += 1;
+    w_acct += 1;
+    w_type += 1;
+    w_date += 1;
+    w_domain += 1;
+    w_org += 1;
+    w_policy += 1;
+
+    try writeTableRow(allocator, &.{
+        .{ .val = "ID", .width = w_id },
+        .{ .val = "ACCOUNT", .width = w_acct },
+        .{ .val = "TYPE", .width = w_type },
+        .{ .val = "DATE", .width = w_date },
+        .{ .val = "DOMAIN", .width = w_domain },
+        .{ .val = "ORGANIZATION", .width = w_org },
+        .{ .val = "POLICY", .width = w_policy },
+    });
+    try writeSepRow(allocator, &.{ w_id, w_acct, w_type, w_date, w_domain, w_org, w_policy });
 
     for (entries) |e| {
         const type_str: []const u8 = switch (e.report_type) {
@@ -636,16 +667,15 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
             .tlsrpt => "TLS-RPT",
         };
         const hash_id = filenameToHashId(e.filename);
-        const line = std.fmt.bufPrint(&buf, "{s:<16} {s:<10} {s:<8} {s:<17} {s:<20} {s:<18} {s:<10}\n", .{
-            hash_id,
-            truncate(e.account_name, 9),
-            type_str,
-            truncate(e.date_begin, 16),
-            truncate(e.domain, 19),
-            truncate(e.org_name, 17),
-            truncate(e.policy, 9),
-        }) catch continue;
-        stdout_file.writeAll(line) catch {};
+        try writeTableRow(allocator, &.{
+            .{ .val = hash_id, .width = w_id },
+            .{ .val = e.account_name, .width = w_acct },
+            .{ .val = type_str, .width = w_type },
+            .{ .val = e.date_begin, .width = w_date },
+            .{ .val = e.domain, .width = w_domain },
+            .{ .val = e.org_name, .width = w_org },
+            .{ .val = e.policy, .width = w_policy },
+        });
     }
 }
 
