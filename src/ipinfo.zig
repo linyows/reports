@@ -151,7 +151,7 @@ fn isPrivateIpv6(ip: []const u8) bool {
     if (ip.len >= 4) {
         if (std.ascii.toLower(ip[0]) == 'f' and std.ascii.toLower(ip[1]) == 'e' and
             (std.ascii.toLower(ip[2]) == '8' or std.ascii.toLower(ip[2]) == '9' or
-            std.ascii.toLower(ip[2]) == 'a' or std.ascii.toLower(ip[2]) == 'b'))
+                std.ascii.toLower(ip[2]) == 'a' or std.ascii.toLower(ip[2]) == 'b'))
             return true;
     }
     // fc00::/7 unique local
@@ -741,9 +741,13 @@ test "parseTxtFromResponse rejects NXDOMAIN" {
         0x81, 0x83, // Flags: QR=1, RD=1, RA=1, RCODE=3
         0x00, 0x01, // QDCOUNT = 1
         0x00, 0x00, // ANCOUNT = 0
-        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
         // Question section (minimal)
-        0x01, 'x', 0x00, 0x00, 0x10, 0x00, 0x01,
+        0x01, 'x',
+        0x00, 0x00,
+        0x10, 0x00,
+        0x01,
     };
     try std.testing.expectError(error.DnsError, parseTxtFromResponse(std.testing.allocator, &resp));
 }
@@ -755,8 +759,12 @@ test "parseTxtFromResponse rejects no answers" {
         0x81, 0x80, // Flags: QR=1, RD=1, RA=1, RCODE=0
         0x00, 0x01, // QDCOUNT = 1
         0x00, 0x00, // ANCOUNT = 0
-        0x00, 0x00, 0x00, 0x00,
-        0x01, 'x', 0x00, 0x00, 0x10, 0x00, 0x01,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x01, 'x',
+        0x00, 0x00,
+        0x10, 0x00,
+        0x01,
     };
     try std.testing.expectError(error.NoAnswer, parseTxtFromResponse(std.testing.allocator, &resp));
 }
