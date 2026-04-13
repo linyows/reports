@@ -968,10 +968,14 @@ fn countryFlag(allocator: std.mem.Allocator, cc: []const u8) ![]const u8 {
     const ri0: u21 = 0x1F1E6 + @as(u21, c0 - 'A');
     const ri1: u21 = 0x1F1E6 + @as(u21, c1 - 'A');
 
-    var buf: [8]u8 = undefined;
-    const len0: usize = std.unicode.utf8Encode(ri0, buf[0..4]) catch return try allocator.dupe(u8, "-");
-    const len1: usize = std.unicode.utf8Encode(ri1, buf[len0 .. len0 + 4][0..4]) catch return try allocator.dupe(u8, "-");
-    return try allocator.dupe(u8, buf[0 .. len0 + len1]);
+    var buf0: [4]u8 = undefined;
+    var buf1: [4]u8 = undefined;
+    const len0: usize = std.unicode.utf8Encode(ri0, &buf0) catch return try allocator.dupe(u8, "-");
+    const len1: usize = std.unicode.utf8Encode(ri1, &buf1) catch return try allocator.dupe(u8, "-");
+    var result: [8]u8 = undefined;
+    @memcpy(result[0..len0], buf0[0..len0]);
+    @memcpy(result[len0 .. len0 + len1], buf1[0..len1]);
+    return try allocator.dupe(u8, result[0 .. len0 + len1]);
 }
 
 fn showTlsTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
