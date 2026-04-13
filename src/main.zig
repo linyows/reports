@@ -772,31 +772,45 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
         }
     }
 
-    // --- Pass 3: output ---
+    // Add 1 char padding so columns don't run together
+    w_ip += 1;
+    w_disp += 1;
+    w_from += 1;
     if (enrich) {
-        // Flag emoji is 4 bytes but renders as ~2 chars wide; header uses 2-char label
+        w_ptr += 1;
+        w_asn += 1;
+    }
+
+    // --- Pass 3: output ---
+    // Fixed column widths (also +1 for padding)
+    const w_cc: usize = 3;
+    const w_count: usize = 6;
+    const w_dkim: usize = 5;
+    const w_spf: usize = 5;
+
+    if (enrich) {
         try writeTableRow(allocator, &.{
             .{ .val = "SOURCE IP", .width = w_ip },
             .{ .val = "PTR", .width = w_ptr },
             .{ .val = "ASN", .width = w_asn },
-            .{ .val = "CC", .width = 2 },
-            .{ .val = "COUNT", .width = 5 },
+            .{ .val = "CC", .width = w_cc },
+            .{ .val = "COUNT", .width = w_count },
             .{ .val = "DISP", .width = w_disp },
             .{ .val = "FROM", .width = w_from },
-            .{ .val = "DKIM", .width = 4 },
-            .{ .val = "SPF", .width = 4 },
+            .{ .val = "DKIM", .width = w_dkim },
+            .{ .val = "SPF", .width = w_spf },
         });
-        try writeSepRow(allocator, &.{ w_ip, w_ptr, w_asn, 2, 5, w_disp, w_from, 4, 4 });
+        try writeSepRow(allocator, &.{ w_ip, w_ptr, w_asn, w_cc, w_count, w_disp, w_from, w_dkim, w_spf });
     } else {
         try writeTableRow(allocator, &.{
             .{ .val = "SOURCE IP", .width = w_ip },
-            .{ .val = "COUNT", .width = 5 },
+            .{ .val = "COUNT", .width = w_count },
             .{ .val = "DISP", .width = w_disp },
             .{ .val = "FROM", .width = w_from },
-            .{ .val = "DKIM", .width = 4 },
-            .{ .val = "SPF", .width = 4 },
+            .{ .val = "DKIM", .width = w_dkim },
+            .{ .val = "SPF", .width = w_spf },
         });
-        try writeSepRow(allocator, &.{ w_ip, 5, w_disp, w_from, 4, 4 });
+        try writeSepRow(allocator, &.{ w_ip, w_count, w_disp, w_from, w_dkim, w_spf });
     }
 
     for (rows.items) |row| {
@@ -808,21 +822,21 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
                 .{ .val = row.source_ip, .width = w_ip },
                 .{ .val = row.ptr_display, .width = w_ptr },
                 .{ .val = row.asn_display, .width = w_asn },
-                .{ .val = row.flag, .width = 2, .is_emoji = true },
-                .{ .val = count_str, .width = 5 },
+                .{ .val = row.flag, .width = w_cc, .is_emoji = true },
+                .{ .val = count_str, .width = w_count },
                 .{ .val = row.disposition, .width = w_disp },
                 .{ .val = row.from, .width = w_from },
-                .{ .val = row.dkim_eval, .width = 4 },
-                .{ .val = row.spf_eval, .width = 4 },
+                .{ .val = row.dkim_eval, .width = w_dkim },
+                .{ .val = row.spf_eval, .width = w_spf },
             });
         } else {
             try writeTableRow(allocator, &.{
                 .{ .val = row.source_ip, .width = w_ip },
-                .{ .val = count_str, .width = 5 },
+                .{ .val = count_str, .width = w_count },
                 .{ .val = row.disposition, .width = w_disp },
                 .{ .val = row.from, .width = w_from },
-                .{ .val = row.dkim_eval, .width = 4 },
-                .{ .val = row.spf_eval, .width = 4 },
+                .{ .val = row.dkim_eval, .width = w_dkim },
+                .{ .val = row.spf_eval, .width = w_spf },
             });
         }
     }
