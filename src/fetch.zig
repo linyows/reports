@@ -42,7 +42,15 @@ fn worker(ctx: *WorkerCtx) void {
         ctx.mailbox,
         ctx.tls,
     );
-    client.connect() catch return;
+    client.connect() catch {
+        for (ctx.uids, 0..) |uid, i| {
+            ctx.results[i] = .{ .uid = uid, .data = null };
+            if (ctx.progress) |p| {
+                _ = p.fetchAdd(1, .monotonic);
+            }
+        }
+        return;
+    };
     defer client.deinit();
 
     for (ctx.uids, 0..) |uid, i| {
@@ -111,7 +119,12 @@ pub fn startFetch(
             .results = results[offset..][0..this_batch],
             .progress = progress,
         };
-        job.threads[job.spawned] = std.Thread.spawn(.{}, worker, .{&job.contexts[job.spawned]}) catch continue;
+        job.threads[job.spawned] = std.Thread.spawn(.{}, worker, .{&job.contexts[job.spawned]}) catch {
+            // Fallback: run synchronously if thread spawn fails
+            worker(&job.contexts[job.spawned]);
+            offset += this_batch;
+            continue;
+        };
         job.spawned += 1;
         offset += this_batch;
     }
@@ -178,7 +191,7 @@ pub fn processResults(
                 saved = true;
             }
         }
-        if (saved) {
+        if (saved and !fetched_set.contains(r.uid)) {
             st.markUidFetched(r.uid);
             fetched_set.put(r.uid, {}) catch {};
         }
