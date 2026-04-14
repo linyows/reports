@@ -37,7 +37,8 @@ pub fn main() !void {
     const enrich = !hasFlag(args, "--no-enrich");
 
     if (std.mem.eql(u8, command, "fetch")) {
-        try cmdFetch(allocator, account);
+        const full = hasFlag(args, "--full");
+        try cmdFetch(allocator, account, full);
     } else if (std.mem.eql(u8, command, "list")) {
         try cmdList(allocator, format orelse "table", domain, account, report_type);
     } else if (std.mem.eql(u8, command, "show")) {
@@ -62,7 +63,7 @@ pub fn main() !void {
     }
 }
 
-fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
+fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, full: bool) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
 
@@ -90,7 +91,7 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
             stdout_file.writeAll(msg) catch {};
         }
 
-        const result = fetchForAccount(allocator, &acct, cfg.data_dir);
+        const result = fetchForAccount(allocator, &acct, cfg.data_dir, full);
 
         var buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Fetched {d} DMARC and {d} TLS-RPT reports.\n", .{
@@ -137,7 +138,7 @@ fn fetchWorker(ctx: *FetchWorkerCtx) void {
     }
 }
 
-fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8) struct { dmarc: u32, tls: u32 } {
+fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8, full: bool) struct { dmarc: u32, tls: u32 } {
     // Use a single connection for UID SEARCH
     var client = reports.imap.Client.init(
         allocator,
@@ -170,10 +171,10 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     };
     defer allocator.free(uids);
 
-    // Collect new (unfetched) UIDs
+    // Collect target UIDs (all when --full, unfetched only otherwise)
     var new_uids: std.ArrayList(u32) = .empty;
     for (uids) |uid| {
-        if (!fetched_set.contains(uid)) new_uids.append(allocator, uid) catch {};
+        if (full or !fetched_set.contains(uid)) new_uids.append(allocator, uid) catch {};
     }
     const new_uid_slice = new_uids.toOwnedSlice(allocator) catch return .{ .dmarc = 0, .tls = 0 };
     defer allocator.free(new_uid_slice);
@@ -1266,6 +1267,7 @@ fn printUsage() void {
         \\  --domain <domain>     Filter by domain
         \\  --type <dmarc|tlsrpt> Filter by report type
         \\  --period <week|month|year> Group summary by period
+        \\  --full                 Re-fetch all messages (ignore fetched history)
         \\  --no-enrich            Disable IP enrichment (PTR/ASN/country)
         \\
         \\Configuration: ~/.config/reports/config.json
