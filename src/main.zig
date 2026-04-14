@@ -37,7 +37,8 @@ pub fn main() !void {
     const enrich = !hasFlag(args, "--no-enrich");
 
     if (std.mem.eql(u8, command, "fetch")) {
-        try cmdFetch(allocator, account);
+        const full = hasFlag(args, "--full");
+        try cmdFetch(allocator, account, full);
     } else if (std.mem.eql(u8, command, "list")) {
         try cmdList(allocator, format orelse "table", domain, account, report_type);
     } else if (std.mem.eql(u8, command, "show")) {
@@ -62,7 +63,7 @@ pub fn main() !void {
     }
 }
 
-fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
+fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, full: bool) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
 
@@ -90,7 +91,7 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
             stdout_file.writeAll(msg) catch {};
         }
 
-        const result = fetchForAccount(allocator, &acct, cfg.data_dir);
+        const result = fetchForAccount(allocator, &acct, cfg.data_dir, full);
 
         var buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Fetched {d} DMARC and {d} TLS-RPT reports.\n", .{
@@ -100,7 +101,8 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
     }
 }
 
-fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8) struct { dmarc: u32, tls: u32 } {
+fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8, full: bool) struct { dmarc: u32, tls: u32 } {
+    // Use a single connection for UID SEARCH
     var client = reports.imap.Client.init(
         allocator,
         acct.host,
@@ -132,74 +134,46 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     };
     defer allocator.free(uids);
 
-    var new_count: usize = 0;
+    // Collect target UIDs (all when --full, unfetched only otherwise)
+    var new_uids: std.ArrayList(u32) = .empty;
     for (uids) |uid| {
-        if (!fetched_set.contains(uid)) new_count += 1;
+        if (full or !fetched_set.contains(uid)) new_uids.append(allocator, uid) catch {};
     }
+    const new_uid_slice = new_uids.toOwnedSlice(allocator) catch return .{ .dmarc = 0, .tls = 0 };
+    defer allocator.free(new_uid_slice);
 
     {
         var buf: [128]u8 = undefined;
-        const found_msg = std.fmt.bufPrint(&buf, "Found {d} messages ({d} new). Fetching...\n", .{ uids.len, new_count }) catch "Fetching...\n";
+        const found_msg = std.fmt.bufPrint(&buf, "Found {d} messages ({d} new). Fetching...\n", .{ uids.len, new_uid_slice.len }) catch "Fetching...\n";
         stdout_file.writeAll(found_msg) catch {};
     }
 
-    var dmarc_count: u32 = 0;
-    var tls_count: u32 = 0;
-    var progress: usize = 0;
-    for (uids) |uid| {
-        if (fetched_set.contains(uid)) continue;
-        progress += 1;
+    if (new_uid_slice.len == 0) return .{ .dmarc = 0, .tls = 0 };
+
+    // Parallel fetch
+    var progress = std.atomic.Value(usize).init(0);
+    var job = reports.fetch.startFetch(allocator, acct, new_uid_slice, &progress) orelse return .{ .dmarc = 0, .tls = 0 };
+    defer reports.fetch.freeResults(allocator, job.results);
+
+    // Show progress while workers are running
+    while (progress.load(.monotonic) < new_uid_slice.len) {
         {
             var pbuf: [64]u8 = undefined;
-            const prog = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ progress, new_count }) catch "";
+            const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
             stderr_file.writeAll(prog) catch {};
         }
-        const raw = client.fetchMessage(uid) catch continue;
-        defer allocator.free(raw);
-
-        const attachments = reports.mime.extractAttachments(allocator, raw) catch continue;
-        defer {
-            for (attachments) |att| {
-                allocator.free(att.filename);
-                allocator.free(att.content_type);
-                allocator.free(att.data);
-            }
-            allocator.free(attachments);
-        }
-
-        var saved = false;
-        for (attachments) |att| {
-            const decompressed = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
-            defer allocator.free(decompressed);
-
-            // Try TLS-RPT first (by content-type or JSON parse), then DMARC (XML parse)
-            if (isTlsrptContentType(att.content_type)) {
-                const report = reports.mtasts.parseJson(allocator, decompressed) catch continue;
-                defer report.deinit(allocator);
-                st.saveTlsReport(&report) catch continue;
-                tls_count += 1;
-                saved = true;
-            } else if (reports.mtasts.parseJson(allocator, decompressed)) |report| {
-                report.deinit(allocator);
-                st.saveTlsReport(&report) catch continue;
-                tls_count += 1;
-                saved = true;
-            } else |_| {
-                const report = reports.dmarc.parseXml(allocator, decompressed) catch continue;
-                defer report.deinit(allocator);
-                st.saveDmarcReport(&report) catch continue;
-                dmarc_count += 1;
-                saved = true;
-            }
-        }
-        if (saved) {
-            st.markUidFetched(uid);
-            fetched_set.put(uid, {}) catch {};
-        }
+        std.Thread.sleep(200 * std.time.ns_per_ms);
     }
-    if (new_count > 0) stderr_file.writeAll("\n") catch {};
+    job.join();
+    {
+        var pbuf: [64]u8 = undefined;
+        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]\n", .{ new_uid_slice.len, new_uid_slice.len }) catch "\n";
+        stderr_file.writeAll(prog) catch {};
+    }
 
-    return .{ .dmarc = dmarc_count, .tls = tls_count };
+    // Process fetched messages on main thread
+    const counts = reports.fetch.processResults(allocator, job.results, &st, &fetched_set);
+    return .{ .dmarc = counts.dmarc, .tls = counts.tls };
 }
 
 fn cmdDomains(allocator: std.mem.Allocator, format: []const u8, account: ?[]const u8) !void {
@@ -1129,11 +1103,6 @@ fn filenameToHashId(filename: []const u8) []const u8 {
     return filename;
 }
 
-fn isTlsrptContentType(ct: []const u8) bool {
-    return std.mem.indexOf(u8, ct, "application/tlsrpt+gzip") != null or
-        std.mem.indexOf(u8, ct, "application/tlsrpt+json") != null;
-}
-
 fn truncate(s: []const u8, max: usize) []const u8 {
     if (s.len <= max) return s;
     return s[0..max];
@@ -1171,6 +1140,7 @@ fn printUsage() void {
         \\  --domain <domain>     Filter by domain
         \\  --type <dmarc|tlsrpt> Filter by report type
         \\  --period <week|month|year> Group summary by period
+        \\  --full                 Re-fetch all messages (ignore fetched history)
         \\  --no-enrich            Disable IP enrichment (PTR/ASN/country)
         \\
         \\Configuration: ~/.config/reports/config.json
@@ -1287,15 +1257,6 @@ test "periodKey returns error for invalid month or day" {
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-13-15 00:00", "week"));
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-06-00 00:00", "week"));
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-06-32 00:00", "week"));
-}
-
-test "isTlsrptContentType" {
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+gzip"));
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+json"));
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+gzip; name=\"report.gz\""));
-    try std.testing.expect(!isTlsrptContentType("application/gzip"));
-    try std.testing.expect(!isTlsrptContentType("application/xml"));
-    try std.testing.expect(!isTlsrptContentType("text/plain"));
 }
 
 test "countryFlag converts country code to flag emoji" {

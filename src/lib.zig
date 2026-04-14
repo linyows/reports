@@ -43,42 +43,19 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
         const uids = client.searchReports() catch continue;
         defer allocator.free(uids);
 
+        var new_uids: std.ArrayList(u32) = .empty;
         for (uids) |uid| {
-            if (fetched_set.contains(uid)) continue;
-            const raw = client.fetchMessage(uid) catch continue;
-            defer allocator.free(raw);
-
-            const attachments = reports.mime.extractAttachments(allocator, raw) catch continue;
-            defer {
-                for (attachments) |att| {
-                    allocator.free(att.filename);
-                    allocator.free(att.content_type);
-                    allocator.free(att.data);
-                }
-                allocator.free(attachments);
-            }
-
-            var saved = false;
-            for (attachments) |att| {
-                const decompressed = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
-                defer allocator.free(decompressed);
-
-                if (reports.mtasts.parseJson(allocator, decompressed)) |report| {
-                    defer report.deinit(allocator);
-                    st.saveTlsReport(&report) catch continue;
-                    saved = true;
-                } else |_| {
-                    const report = reports.dmarc.parseXml(allocator, decompressed) catch continue;
-                    defer report.deinit(allocator);
-                    st.saveDmarcReport(&report) catch continue;
-                    saved = true;
-                }
-            }
-            if (saved) {
-                st.markUidFetched(uid);
-                fetched_set.put(uid, {}) catch {};
-            }
+            if (!fetched_set.contains(uid)) new_uids.append(allocator, uid) catch {};
         }
+        const new_uid_slice = new_uids.toOwnedSlice(allocator) catch continue;
+        defer allocator.free(new_uid_slice);
+
+        if (new_uid_slice.len == 0) continue;
+
+        const results = reports.fetch.fetchMessages(allocator, &acct, new_uid_slice, null) orelse continue;
+        defer reports.fetch.freeResults(allocator, results);
+
+        _ = reports.fetch.processResults(allocator, results, &st, &fetched_set);
     }
 
     return 0;
