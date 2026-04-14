@@ -100,7 +100,45 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8) !void {
     }
 }
 
+const max_fetch_workers = 16;
+
+const FetchedMessage = struct {
+    uid: u32,
+    data: ?[]const u8,
+};
+
+const FetchWorkerCtx = struct {
+    allocator: std.mem.Allocator,
+    acct: *const Config.Account,
+    uids: []const u32,
+    results: []FetchedMessage,
+    progress: *std.atomic.Value(usize),
+};
+
+fn fetchWorker(ctx: *FetchWorkerCtx) void {
+    var client = reports.imap.Client.init(
+        ctx.allocator,
+        ctx.acct.host,
+        ctx.acct.port,
+        ctx.acct.username,
+        ctx.acct.password,
+        ctx.acct.mailbox,
+        ctx.acct.tls,
+    );
+    client.connect() catch return;
+    defer client.deinit();
+
+    for (ctx.uids, 0..) |uid, i| {
+        ctx.results[i] = .{
+            .uid = uid,
+            .data = client.fetchMessage(uid) catch null,
+        };
+        _ = ctx.progress.fetchAdd(1, .monotonic);
+    }
+}
+
 fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8) struct { dmarc: u32, tls: u32 } {
+    // Use a single connection for UID SEARCH
     var client = reports.imap.Client.init(
         allocator,
         acct.host,
@@ -132,30 +170,88 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     };
     defer allocator.free(uids);
 
-    var new_count: usize = 0;
+    // Collect new (unfetched) UIDs
+    var new_uids: std.ArrayList(u32) = .empty;
     for (uids) |uid| {
-        if (!fetched_set.contains(uid)) new_count += 1;
+        if (!fetched_set.contains(uid)) new_uids.append(allocator, uid) catch {};
     }
+    const new_uid_slice = new_uids.toOwnedSlice(allocator) catch return .{ .dmarc = 0, .tls = 0 };
+    defer allocator.free(new_uid_slice);
 
     {
         var buf: [128]u8 = undefined;
-        const found_msg = std.fmt.bufPrint(&buf, "Found {d} messages ({d} new). Fetching...\n", .{ uids.len, new_count }) catch "Fetching...\n";
+        const found_msg = std.fmt.bufPrint(&buf, "Found {d} messages ({d} new). Fetching...\n", .{ uids.len, new_uid_slice.len }) catch "Fetching...\n";
         stdout_file.writeAll(found_msg) catch {};
     }
 
-    var dmarc_count: u32 = 0;
-    var tls_count: u32 = 0;
-    var progress: usize = 0;
-    for (uids) |uid| {
-        if (fetched_set.contains(uid)) continue;
-        progress += 1;
+    if (new_uid_slice.len == 0) return .{ .dmarc = 0, .tls = 0 };
+
+    // Allocate results array for all new UIDs
+    const all_results = allocator.alloc(FetchedMessage, new_uid_slice.len) catch return .{ .dmarc = 0, .tls = 0 };
+    defer {
+        for (all_results) |r| {
+            if (r.data) |d| allocator.free(d);
+        }
+        allocator.free(all_results);
+    }
+    for (all_results) |*r| {
+        r.* = .{ .uid = 0, .data = null };
+    }
+
+    // Determine actual number of workers based on CPU cores
+    const cpu_count = std.Thread.getCpuCount() catch 2;
+    const num_workers = @min(@min(cpu_count, max_fetch_workers), new_uid_slice.len);
+    const batch_size = new_uid_slice.len / num_workers;
+    const remainder = new_uid_slice.len % num_workers;
+
+    var progress = std.atomic.Value(usize).init(0);
+
+    // Prepare worker contexts and spawn threads
+    var contexts: [max_fetch_workers]FetchWorkerCtx = undefined;
+    var threads: [max_fetch_workers]std.Thread = undefined;
+    var spawned: usize = 0;
+
+    var offset: usize = 0;
+    for (0..num_workers) |i| {
+        const this_batch = batch_size + @as(usize, if (i < remainder) 1 else 0);
+        contexts[i] = .{
+            .allocator = allocator,
+            .acct = acct,
+            .uids = new_uid_slice[offset..][0..this_batch],
+            .results = all_results[offset..][0..this_batch],
+            .progress = &progress,
+        };
+        threads[i] = std.Thread.spawn(.{}, fetchWorker, .{&contexts[i]}) catch continue;
+        spawned += 1;
+        offset += this_batch;
+    }
+
+    // Show progress while workers are running
+    while (progress.load(.monotonic) < new_uid_slice.len) {
         {
             var pbuf: [64]u8 = undefined;
-            const prog = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ progress, new_count }) catch "";
+            const prog = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
             stderr_file.writeAll(prog) catch {};
         }
-        const raw = client.fetchMessage(uid) catch continue;
-        defer allocator.free(raw);
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+    }
+
+    // Join all threads
+    for (0..spawned) |i| {
+        threads[i].join();
+    }
+
+    {
+        var pbuf: [64]u8 = undefined;
+        const prog = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]\n", .{ new_uid_slice.len, new_uid_slice.len }) catch "\n";
+        stderr_file.writeAll(prog) catch {};
+    }
+
+    // Process fetched messages on main thread
+    var dmarc_count: u32 = 0;
+    var tls_count: u32 = 0;
+    for (all_results) |r| {
+        const raw = r.data orelse continue;
 
         const attachments = reports.mime.extractAttachments(allocator, raw) catch continue;
         defer {
@@ -193,11 +289,10 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
             }
         }
         if (saved) {
-            st.markUidFetched(uid);
-            fetched_set.put(uid, {}) catch {};
+            st.markUidFetched(r.uid);
+            fetched_set.put(r.uid, {}) catch {};
         }
     }
-    if (new_count > 0) stderr_file.writeAll("\n") catch {};
 
     return .{ .dmarc = dmarc_count, .tls = tls_count };
 }

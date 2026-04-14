@@ -13,6 +13,46 @@ export fn reports_deinit() void {
     reports.imap.globalCleanup();
 }
 
+const lib_max_fetch_workers = 16;
+
+const LibFetchedMessage = struct {
+    uid: u32,
+    data: ?[]const u8,
+};
+
+const LibFetchWorkerCtx = struct {
+    alloc: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    username: []const u8,
+    password: []const u8,
+    mailbox: []const u8,
+    tls: bool,
+    uids: []const u32,
+    results: []LibFetchedMessage,
+};
+
+fn libFetchWorker(ctx: *LibFetchWorkerCtx) void {
+    var client = reports.imap.Client.init(
+        ctx.alloc,
+        ctx.host,
+        ctx.port,
+        ctx.username,
+        ctx.password,
+        ctx.mailbox,
+        ctx.tls,
+    );
+    client.connect() catch return;
+    defer client.deinit();
+
+    for (ctx.uids, 0..) |uid, i| {
+        ctx.results[i] = .{
+            .uid = uid,
+            .data = client.fetchMessage(uid) catch null,
+        };
+    }
+}
+
 export fn reports_fetch(config_json: [*:0]const u8) c_int {
     const cfg = reports.config.Config.fromJson(allocator, std.mem.span(config_json)) catch return -1;
     defer cfg.deinit(allocator);
@@ -23,6 +63,7 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
     for (cfg.accounts) |acct| {
         if (acct.host.len == 0) continue;
 
+        // Use a single connection for UID SEARCH
         var client = reports.imap.Client.init(
             allocator,
             acct.host,
@@ -43,10 +84,64 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
         const uids = client.searchReports() catch continue;
         defer allocator.free(uids);
 
+        // Collect new UIDs
+        var new_uids: std.ArrayList(u32) = .empty;
         for (uids) |uid| {
-            if (fetched_set.contains(uid)) continue;
-            const raw = client.fetchMessage(uid) catch continue;
-            defer allocator.free(raw);
+            if (!fetched_set.contains(uid)) new_uids.append(allocator, uid) catch {};
+        }
+        const new_uid_slice = new_uids.toOwnedSlice(allocator) catch continue;
+        defer allocator.free(new_uid_slice);
+
+        if (new_uid_slice.len == 0) continue;
+
+        // Allocate results
+        const all_results = allocator.alloc(LibFetchedMessage, new_uid_slice.len) catch continue;
+        defer {
+            for (all_results) |r| {
+                if (r.data) |d| allocator.free(d);
+            }
+            allocator.free(all_results);
+        }
+        for (all_results) |*r| {
+            r.* = .{ .uid = 0, .data = null };
+        }
+
+        // Spawn worker threads based on CPU cores
+        const cpu_count = std.Thread.getCpuCount() catch 2;
+        const num_workers = @min(@min(cpu_count, lib_max_fetch_workers), new_uid_slice.len);
+        const batch_size = new_uid_slice.len / num_workers;
+        const remainder = new_uid_slice.len % num_workers;
+
+        var contexts: [lib_max_fetch_workers]LibFetchWorkerCtx = undefined;
+        var threads: [lib_max_fetch_workers]std.Thread = undefined;
+        var spawned: usize = 0;
+
+        var offset: usize = 0;
+        for (0..num_workers) |i| {
+            const this_batch = batch_size + @as(usize, if (i < remainder) 1 else 0);
+            contexts[i] = .{
+                .alloc = allocator,
+                .host = acct.host,
+                .port = acct.port,
+                .username = acct.username,
+                .password = acct.password,
+                .mailbox = acct.mailbox,
+                .tls = acct.tls,
+                .uids = new_uid_slice[offset..][0..this_batch],
+                .results = all_results[offset..][0..this_batch],
+            };
+            threads[i] = std.Thread.spawn(.{}, libFetchWorker, .{&contexts[i]}) catch continue;
+            spawned += 1;
+            offset += this_batch;
+        }
+
+        for (0..spawned) |i| {
+            threads[i].join();
+        }
+
+        // Process results on main thread
+        for (all_results) |r| {
+            const raw = r.data orelse continue;
 
             const attachments = reports.mime.extractAttachments(allocator, raw) catch continue;
             defer {
@@ -75,8 +170,8 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
                 }
             }
             if (saved) {
-                st.markUidFetched(uid);
-                fetched_set.put(uid, {}) catch {};
+                st.markUidFetched(r.uid);
+                fetched_set.put(r.uid, {}) catch {};
             }
         }
     }
