@@ -211,6 +211,28 @@ reports_free_string(json);
 reports_deinit();
 ```
 
+## 他ツールとの比較
+
+| ツール | 言語 | UI | DMARC | TLS-RPT | IMAP取得 | 外部インフラ不要 |
+|--------|------|----|:-----:|:-------:|:--------:|:---------------:|
+| **Reports** | **Zig + Swift** | **CLI + macOSネイティブ** | **Yes** | **Yes** | **Yes (並列)** | **Yes** |
+| [parsedmarc](https://github.com/domainaware/parsedmarc) | Python | CLI + Elasticsearch/Grafana | Yes | No | Yes | No |
+| [dmarc-report-viewer](https://github.com/cry-inc/dmarc-report-viewer) | Rust | Web (単一バイナリ) | Yes | Yes | Yes | Yes |
+| [dmarcguard](https://github.com/dmarcguardhq/dmarcguard) | Go + Vue.js | Web (単一バイナリ) | Yes | No | Yes | Yes |
+| [dmarc-visualizer](https://github.com/debricked/dmarc-visualizer) | Docker | Web (Grafana) | Yes | No | No | No |
+| [dmarc-report-converter](https://github.com/tierpod/dmarc-report-converter) | Go | CLI | Yes | No | No | Yes |
+| [dmarc-srg](https://github.com/liuch/dmarc-srg) | PHP | Web | Yes | No | No | No |
+| [Viesti-Reports](https://github.com/antedebaas/Viesti-Reports) | PHP | Web | Yes | Yes | No | No |
+
+**Reportsの主な差別化ポイント:**
+
+- **ネイティブmacOSアプリ** -- オープンソースのDMARC/TLS-RPTツールで唯一、ネイティブデスクトップGUI（SwiftUI）を備える
+- **ヘッドレスコアアーキテクチャ** -- ZigコアをC ABIスタティックライブラリとしてビルドし、CLIとネイティブUIを単一コードベースから提供（[Ghostty](https://github.com/ghostty-org/ghostty)に着想）
+- **並列IMAPフェッチ** -- CPUコア数に自動調整されるマルチスレッドワーカープールにより、逐次取得比で約3.5倍高速
+- **外部インフラ不要** -- データベース、Webサーバー、Docker不要。設定ファイルとローカルJSON保存のみで動作
+- **DNSベースのIP情報付加** -- PTR、ASN、組織名、国情報をDNSクエリ（Team Cymru）で取得。外部APIキーやGeoIPデータベース不要
+- **監視システム連携** -- `check`コマンドが終了コード（0/1/2）で異常を通知。cronや監視システムとの統合に対応
+
 ## 開発
 
 ```bash

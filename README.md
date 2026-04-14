@@ -203,6 +203,28 @@ reports_free_string(json);
 reports_deinit();
 ```
 
+## Comparison with Other Tools
+
+| Tool | Language | UI | DMARC | TLS-RPT | IMAP Fetch | No Infra Required |
+|------|----------|----|:-----:|:-------:|:----------:|:-----------------:|
+| **Reports** | **Zig + Swift** | **CLI + macOS native** | **Yes** | **Yes** | **Yes (parallel)** | **Yes** |
+| [parsedmarc](https://github.com/domainaware/parsedmarc) | Python | CLI + Elasticsearch/Grafana | Yes | No | Yes | No |
+| [dmarc-report-viewer](https://github.com/cry-inc/dmarc-report-viewer) | Rust | Web (single binary) | Yes | Yes | Yes | Yes |
+| [dmarcguard](https://github.com/dmarcguardhq/dmarcguard) | Go + Vue.js | Web (single binary) | Yes | No | Yes | Yes |
+| [dmarc-visualizer](https://github.com/debricked/dmarc-visualizer) | Docker | Web (Grafana) | Yes | No | No | No |
+| [dmarc-report-converter](https://github.com/tierpod/dmarc-report-converter) | Go | CLI | Yes | No | No | Yes |
+| [dmarc-srg](https://github.com/liuch/dmarc-srg) | PHP | Web | Yes | No | No | No |
+| [Viesti-Reports](https://github.com/antedebaas/Viesti-Reports) | PHP | Web | Yes | Yes | No | No |
+
+**Key differentiators of Reports:**
+
+- **Native macOS app** -- The only open-source DMARC/TLS-RPT tool with a native desktop GUI (SwiftUI), not just a web UI or CLI
+- **Headless core architecture** -- Zig-based core compiled to a C ABI static library, enabling both CLI and native UI from a single codebase (inspired by [Ghostty](https://github.com/ghostty-org/ghostty))
+- **Parallel IMAP fetch** -- Multi-threaded worker pool auto-scaled to CPU cores, ~3.5x faster than sequential fetch
+- **Zero external infrastructure** -- No database, web server, or Docker required; just a config file and local JSON storage
+- **DNS-based IP enrichment** -- PTR, ASN, organization, and country lookup via DNS queries (Team Cymru) without external API keys or GeoIP databases
+- **Monitoring integration** -- `check` command with exit codes (0/1/2) for anomaly detection, designed for cron jobs and monitoring systems
+
 ## Development
 
 ```bash
