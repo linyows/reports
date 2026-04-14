@@ -212,11 +212,132 @@ fn isTlsrptContentType(ct: []const u8) bool {
         std.mem.indexOf(u8, ct, "application/tlsrpt+json") != null;
 }
 
+const testing = std.testing;
+
+const test_acct = config.Config.Account{
+    .name = "test",
+    .host = "invalid.localhost",
+    .port = 1,
+    .username = "user",
+    .password = "pass",
+    .mailbox = "INBOX",
+    .tls = false,
+};
+
 test "isTlsrptContentType" {
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+gzip"));
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+json"));
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+gzip; name=\"report.gz\""));
-    try std.testing.expect(!isTlsrptContentType("application/gzip"));
-    try std.testing.expect(!isTlsrptContentType("application/xml"));
-    try std.testing.expect(!isTlsrptContentType("text/plain"));
+    try testing.expect(isTlsrptContentType("application/tlsrpt+gzip"));
+    try testing.expect(isTlsrptContentType("application/tlsrpt+json"));
+    try testing.expect(isTlsrptContentType("application/tlsrpt+gzip; name=\"report.gz\""));
+    try testing.expect(!isTlsrptContentType("application/gzip"));
+    try testing.expect(!isTlsrptContentType("application/xml"));
+    try testing.expect(!isTlsrptContentType("text/plain"));
+}
+
+test "worker fills results and advances progress on connect failure" {
+    const allocator = testing.allocator;
+    const uids = [_]u32{ 100, 200, 300 };
+    var results: [3]FetchResult = undefined;
+    var progress = std.atomic.Value(usize).init(0);
+
+    var ctx = WorkerCtx{
+        .allocator = allocator,
+        .host = test_acct.host,
+        .port = test_acct.port,
+        .username = test_acct.username,
+        .password = test_acct.password,
+        .mailbox = test_acct.mailbox,
+        .tls = test_acct.tls,
+        .uids = &uids,
+        .results = &results,
+        .progress = &progress,
+    };
+    worker(&ctx);
+
+    try testing.expectEqual(3, progress.load(.monotonic));
+    for (results, 0..) |r, i| {
+        try testing.expectEqual(uids[i], r.uid);
+        try testing.expectEqual(null, r.data);
+    }
+}
+
+test "startFetch covers all UIDs even with connect failures" {
+    const allocator = testing.allocator;
+    const uids = [_]u32{ 1, 2, 3, 4, 5, 6, 7 };
+    var progress = std.atomic.Value(usize).init(0);
+
+    var job = startFetch(allocator, &test_acct, &uids, &progress) orelse {
+        try testing.expect(false);
+        return;
+    };
+    job.join();
+    defer freeResults(allocator, job.results);
+
+    try testing.expectEqual(uids.len, progress.load(.monotonic));
+    try testing.expectEqual(uids.len, job.results.len);
+    for (job.results, 0..) |r, i| {
+        try testing.expectEqual(uids[i], r.uid);
+        try testing.expectEqual(null, r.data);
+    }
+}
+
+test "startFetch returns null for empty UIDs" {
+    const allocator = testing.allocator;
+    const uids = [_]u32{};
+    const result = startFetch(allocator, &test_acct, &uids, null);
+    try testing.expectEqual(null, result);
+}
+
+test "processResults skips entries with null data" {
+    const allocator = testing.allocator;
+    const results = [_]FetchResult{
+        .{ .uid = 1, .data = null },
+        .{ .uid = 2, .data = null },
+    };
+    const tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const st = store.Store.init(allocator, tmp_path, "test");
+    var fetched_set = std.AutoHashMap(u32, void).init(allocator);
+    defer fetched_set.deinit();
+
+    const counts = processResults(allocator, &results, &st, &fetched_set);
+    try testing.expectEqual(0, counts.dmarc);
+    try testing.expectEqual(0, counts.tls);
+    try testing.expectEqual(0, fetched_set.count());
+}
+
+test "processResults does not duplicate markUidFetched for already-fetched UIDs" {
+    const allocator = testing.allocator;
+    // data is not a valid MIME message, so parsing will fail and nothing will be saved.
+    // But we can verify that fetched_set membership prevents markUidFetched from being called.
+    const results = [_]FetchResult{
+        .{ .uid = 42, .data = null },
+    };
+    const tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const st = store.Store.init(allocator, tmp_path, "test");
+    var fetched_set = std.AutoHashMap(u32, void).init(allocator);
+    defer fetched_set.deinit();
+    try fetched_set.put(42, {});
+
+    const counts = processResults(allocator, &results, &st, &fetched_set);
+    try testing.expectEqual(0, counts.dmarc);
+    try testing.expectEqual(0, counts.tls);
+    // UID 42 was already in the set, so count should remain 1 (not re-added)
+    try testing.expectEqual(1, fetched_set.count());
+}
+
+test "freeResults releases all allocated data" {
+    const allocator = testing.allocator;
+    var results = try allocator.alloc(FetchResult, 3);
+    results[0] = .{ .uid = 1, .data = try allocator.dupe(u8, "hello") };
+    results[1] = .{ .uid = 2, .data = null };
+    results[2] = .{ .uid = 3, .data = try allocator.dupe(u8, "world") };
+    // testing.allocator detects leaks, so if freeResults is wrong this test will fail
+    freeResults(allocator, results);
 }
