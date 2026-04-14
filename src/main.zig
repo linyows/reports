@@ -101,43 +101,6 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, full: boo
     }
 }
 
-const max_fetch_workers = 16;
-
-const FetchedMessage = struct {
-    uid: u32,
-    data: ?[]const u8,
-};
-
-const FetchWorkerCtx = struct {
-    allocator: std.mem.Allocator,
-    acct: *const Config.Account,
-    uids: []const u32,
-    results: []FetchedMessage,
-    progress: *std.atomic.Value(usize),
-};
-
-fn fetchWorker(ctx: *FetchWorkerCtx) void {
-    var client = reports.imap.Client.init(
-        ctx.allocator,
-        ctx.acct.host,
-        ctx.acct.port,
-        ctx.acct.username,
-        ctx.acct.password,
-        ctx.acct.mailbox,
-        ctx.acct.tls,
-    );
-    client.connect() catch return;
-    defer client.deinit();
-
-    for (ctx.uids, 0..) |uid, i| {
-        ctx.results[i] = .{
-            .uid = uid,
-            .data = client.fetchMessage(uid) catch null,
-        };
-        _ = ctx.progress.fetchAdd(1, .monotonic);
-    }
-}
-
 fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8, full: bool) struct { dmarc: u32, tls: u32 } {
     // Use a single connection for UID SEARCH
     var client = reports.imap.Client.init(
@@ -187,50 +150,13 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
 
     if (new_uid_slice.len == 0) return .{ .dmarc = 0, .tls = 0 };
 
-    // Allocate results array for all new UIDs
-    const all_results = allocator.alloc(FetchedMessage, new_uid_slice.len) catch return .{ .dmarc = 0, .tls = 0 };
-    defer {
-        for (all_results) |r| {
-            if (r.data) |d| allocator.free(d);
-        }
-        allocator.free(all_results);
-    }
-    for (all_results) |*r| {
-        r.* = .{ .uid = 0, .data = null };
-    }
-
-    // Determine actual number of workers based on CPU cores
-    const cpu_count = std.Thread.getCpuCount() catch 2;
-    const num_workers = @min(@min(cpu_count, max_fetch_workers), new_uid_slice.len);
-    const batch_size = new_uid_slice.len / num_workers;
-    const remainder = new_uid_slice.len % num_workers;
-
+    // Parallel fetch
     var progress = std.atomic.Value(usize).init(0);
-
-    // Prepare worker contexts and spawn threads
-    var contexts: [max_fetch_workers]FetchWorkerCtx = undefined;
-    var threads: [max_fetch_workers]std.Thread = undefined;
-    var spawned: usize = 0;
-    var assigned: usize = 0;
-
-    var offset: usize = 0;
-    for (0..num_workers) |i| {
-        const this_batch = batch_size + @as(usize, if (i < remainder) 1 else 0);
-        contexts[spawned] = .{
-            .allocator = allocator,
-            .acct = acct,
-            .uids = new_uid_slice[offset..][0..this_batch],
-            .results = all_results[offset..][0..this_batch],
-            .progress = &progress,
-        };
-        threads[spawned] = std.Thread.spawn(.{}, fetchWorker, .{&contexts[spawned]}) catch continue;
-        spawned += 1;
-        assigned += this_batch;
-        offset += this_batch;
-    }
+    var job = reports.fetch.startFetch(allocator, acct, new_uid_slice, &progress) orelse return .{ .dmarc = 0, .tls = 0 };
+    defer reports.fetch.freeResults(allocator, job.results);
 
     // Show progress while workers are running
-    while (progress.load(.monotonic) < assigned) {
+    while (progress.load(.monotonic) < new_uid_slice.len) {
         {
             var pbuf: [64]u8 = undefined;
             const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
@@ -238,66 +164,16 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
         }
         std.Thread.sleep(200 * std.time.ns_per_ms);
     }
-
-    // Join all threads
-    for (0..spawned) |i| {
-        threads[i].join();
-    }
-
+    job.join();
     {
         var pbuf: [64]u8 = undefined;
-        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]\n", .{ assigned, new_uid_slice.len }) catch "\n";
+        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]\n", .{ new_uid_slice.len, new_uid_slice.len }) catch "\n";
         stderr_file.writeAll(prog) catch {};
     }
 
     // Process fetched messages on main thread
-    var dmarc_count: u32 = 0;
-    var tls_count: u32 = 0;
-    for (all_results) |r| {
-        const raw = r.data orelse continue;
-
-        const attachments = reports.mime.extractAttachments(allocator, raw) catch continue;
-        defer {
-            for (attachments) |att| {
-                allocator.free(att.filename);
-                allocator.free(att.content_type);
-                allocator.free(att.data);
-            }
-            allocator.free(attachments);
-        }
-
-        var saved = false;
-        for (attachments) |att| {
-            const decompressed = reports.mime.decompress(allocator, att.data, att.filename) catch continue;
-            defer allocator.free(decompressed);
-
-            // Try TLS-RPT first (by content-type or JSON parse), then DMARC (XML parse)
-            if (isTlsrptContentType(att.content_type)) {
-                const report = reports.mtasts.parseJson(allocator, decompressed) catch continue;
-                defer report.deinit(allocator);
-                st.saveTlsReport(&report) catch continue;
-                tls_count += 1;
-                saved = true;
-            } else if (reports.mtasts.parseJson(allocator, decompressed)) |report| {
-                report.deinit(allocator);
-                st.saveTlsReport(&report) catch continue;
-                tls_count += 1;
-                saved = true;
-            } else |_| {
-                const report = reports.dmarc.parseXml(allocator, decompressed) catch continue;
-                defer report.deinit(allocator);
-                st.saveDmarcReport(&report) catch continue;
-                dmarc_count += 1;
-                saved = true;
-            }
-        }
-        if (saved) {
-            st.markUidFetched(r.uid);
-            fetched_set.put(r.uid, {}) catch {};
-        }
-    }
-
-    return .{ .dmarc = dmarc_count, .tls = tls_count };
+    const counts = reports.fetch.processResults(allocator, job.results, &st, &fetched_set);
+    return .{ .dmarc = counts.dmarc, .tls = counts.tls };
 }
 
 fn cmdDomains(allocator: std.mem.Allocator, format: []const u8, account: ?[]const u8) !void {
@@ -1227,11 +1103,6 @@ fn filenameToHashId(filename: []const u8) []const u8 {
     return filename;
 }
 
-fn isTlsrptContentType(ct: []const u8) bool {
-    return std.mem.indexOf(u8, ct, "application/tlsrpt+gzip") != null or
-        std.mem.indexOf(u8, ct, "application/tlsrpt+json") != null;
-}
-
 fn truncate(s: []const u8, max: usize) []const u8 {
     if (s.len <= max) return s;
     return s[0..max];
@@ -1386,15 +1257,6 @@ test "periodKey returns error for invalid month or day" {
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-13-15 00:00", "week"));
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-06-00 00:00", "week"));
     try std.testing.expectError(error.InvalidDate, periodKey(allocator, "2024-06-32 00:00", "week"));
-}
-
-test "isTlsrptContentType" {
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+gzip"));
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+json"));
-    try std.testing.expect(isTlsrptContentType("application/tlsrpt+gzip; name=\"report.gz\""));
-    try std.testing.expect(!isTlsrptContentType("application/gzip"));
-    try std.testing.expect(!isTlsrptContentType("application/xml"));
-    try std.testing.expect(!isTlsrptContentType("text/plain"));
 }
 
 test "countryFlag converts country code to flag emoji" {
