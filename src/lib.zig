@@ -119,7 +119,7 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
         var offset: usize = 0;
         for (0..num_workers) |i| {
             const this_batch = batch_size + @as(usize, if (i < remainder) 1 else 0);
-            contexts[i] = .{
+            contexts[spawned] = .{
                 .alloc = allocator,
                 .host = acct.host,
                 .port = acct.port,
@@ -130,7 +130,7 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
                 .uids = new_uid_slice[offset..][0..this_batch],
                 .results = all_results[offset..][0..this_batch],
             };
-            threads[i] = std.Thread.spawn(.{}, libFetchWorker, .{&contexts[i]}) catch continue;
+            threads[spawned] = std.Thread.spawn(.{}, libFetchWorker, .{&contexts[spawned]}) catch continue;
             spawned += 1;
             offset += this_batch;
         }

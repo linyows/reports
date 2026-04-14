@@ -211,24 +211,26 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     var contexts: [max_fetch_workers]FetchWorkerCtx = undefined;
     var threads: [max_fetch_workers]std.Thread = undefined;
     var spawned: usize = 0;
+    var assigned: usize = 0;
 
     var offset: usize = 0;
     for (0..num_workers) |i| {
         const this_batch = batch_size + @as(usize, if (i < remainder) 1 else 0);
-        contexts[i] = .{
+        contexts[spawned] = .{
             .allocator = allocator,
             .acct = acct,
             .uids = new_uid_slice[offset..][0..this_batch],
             .results = all_results[offset..][0..this_batch],
             .progress = &progress,
         };
-        threads[i] = std.Thread.spawn(.{}, fetchWorker, .{&contexts[i]}) catch continue;
+        threads[spawned] = std.Thread.spawn(.{}, fetchWorker, .{&contexts[spawned]}) catch continue;
         spawned += 1;
+        assigned += this_batch;
         offset += this_batch;
     }
 
     // Show progress while workers are running
-    while (progress.load(.monotonic) < new_uid_slice.len) {
+    while (progress.load(.monotonic) < assigned) {
         {
             var pbuf: [64]u8 = undefined;
             const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
@@ -244,7 +246,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
 
     {
         var pbuf: [64]u8 = undefined;
-        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]\n", .{ new_uid_slice.len, new_uid_slice.len }) catch "\n";
+        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]\n", .{ assigned, new_uid_slice.len }) catch "\n";
         stderr_file.writeAll(prog) catch {};
     }
 
