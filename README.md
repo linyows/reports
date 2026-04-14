@@ -56,6 +56,7 @@ graph TD
 - List, show, and summarize reports with table or JSON output
 - Filter by account, domain, and time period (week/month/year)
 - Incremental fetch with UID tracking (skips already-fetched messages)
+- Parallel IMAP fetch with multiple connections, auto-scaled to CPU cores (~3.5x faster)
 - Headless core with C ABI static library for native UI integration
 
 ## Installation
@@ -115,7 +116,10 @@ Legacy single-account format (`"imap": {...}`) is also supported and treated as 
 ```bash
 $ reports fetch
 $ reports fetch --account personal
+$ reports fetch --full          # re-fetch all messages
 ```
+
+Messages are fetched in parallel using multiple IMAP connections (auto-scaled to CPU cores). Subsequent runs skip already-fetched messages via UID tracking.
 
 ### List reports
 
@@ -167,6 +171,17 @@ $ reports summary --account personal --domain example.com --format json
 $ reports domains
 $ reports domains --format json
 ```
+
+## Performance
+
+The `fetch` command uses parallel IMAP connections to download messages concurrently. The number of workers is automatically determined based on CPU core count (up to 16).
+
+| Mode | 224 messages |
+|---|---|
+| Sequential (single connection) | 1m 54s |
+| Parallel (auto-scaled workers) | 33s |
+
+Incremental UID tracking ensures that subsequent runs only fetch new messages, making regular use nearly instant.
 
 ## C ABI / SwiftUI Integration
 
