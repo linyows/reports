@@ -231,7 +231,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     while (progress.load(.monotonic) < new_uid_slice.len) {
         {
             var pbuf: [64]u8 = undefined;
-            const prog = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
+            const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
             stderr_file.writeAll(prog) catch {};
         }
         std.Thread.sleep(200 * std.time.ns_per_ms);
@@ -244,7 +244,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
 
     {
         var pbuf: [64]u8 = undefined;
-        const prog = std.fmt.bufPrint(&pbuf, "\r  [{d}/{d}]\n", .{ new_uid_slice.len, new_uid_slice.len }) catch "\n";
+        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]\n", .{ new_uid_slice.len, new_uid_slice.len }) catch "\n";
         stderr_file.writeAll(prog) catch {};
     }
 
