@@ -193,7 +193,7 @@ struct DashboardView: View {
         }
         .navigationTitle("Dashboard")
         .background(Color(.windowBackgroundColor))
-        .task(id: viewModel.entries.count) {
+        .task(id: viewModel.entriesVersion) {
             await loader.load(entries: viewModel.entries)
         }
     }

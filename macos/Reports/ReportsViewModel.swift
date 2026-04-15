@@ -4,6 +4,10 @@ import SwiftUI
 @MainActor
 final class ReportsViewModel: ObservableObject {
     @Published var entries: [ReportEntry] = []
+    /// Increments each time `entries` is replaced. Views can key `.task(id:)` or
+    /// `.onChange` on this to detect refreshes reliably, including edge cases
+    /// where the count stays the same but contents differ.
+    @Published var entriesVersion: Int = 0
     @Published var selectedEntryID: ReportEntry.ID?
     @Published var detailJSON: String?
     @Published var isFetching = false
@@ -84,6 +88,7 @@ final class ReportsViewModel: ObservableObject {
         errorMessage = nil
         do {
             entries = try core.list()
+            entriesVersion &+= 1
         } catch {
             errorMessage = error.localizedDescription
         }

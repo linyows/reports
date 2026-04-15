@@ -38,8 +38,16 @@ pub const Cache = struct {
             .map = std.StringHashMap(Entry).init(allocator),
             .path = path,
         };
+        // Clean up any orphaned .tmp file from a prior crash during compaction.
+        cache.cleanupOrphanTmp();
         cache.loadFromDisk() catch {};
         return cache;
+    }
+
+    fn cleanupOrphanTmp(self: *Cache) void {
+        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path}) catch return;
+        defer self.allocator.free(tmp_path);
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
     }
 
     pub fn deinit(self: *Cache) void {
@@ -73,6 +81,8 @@ pub const Cache = struct {
 
     /// Insert or replace an entry. Updates the in-memory map and appends a
     /// single line to the cache file. Cache takes ownership of new copies.
+    /// Propagates I/O errors so callers can surface disk-full / permission issues
+    /// rather than silently losing the persisted entry.
     pub fn put(self: *Cache, ip: []const u8, info: ipinfo.IpInfo) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -80,13 +90,8 @@ pub const Cache = struct {
         const ip_copy = try self.allocator.dupe(u8, ip);
         errdefer self.allocator.free(ip_copy);
 
-        const entry = Entry{
-            .ptr = try self.allocator.dupe(u8, info.ptr),
-            .asn = try self.allocator.dupe(u8, info.asn),
-            .asn_org = try self.allocator.dupe(u8, info.asn_org),
-            .country = try self.allocator.dupe(u8, info.country),
-            .ts = std.time.timestamp(),
-        };
+        const entry = try makeEntry(self.allocator, info);
+        errdefer freeEntryFields(self.allocator, entry);
 
         if (self.map.fetchRemove(ip)) |old| {
             self.allocator.free(old.key);
@@ -94,7 +99,15 @@ pub const Cache = struct {
         }
         try self.map.put(ip_copy, entry);
 
-        self.appendLine(ip, entry) catch {};
+        // If appendLine fails, roll back the map insert so in-memory and
+        // on-disk state stay consistent.
+        self.appendLine(ip, entry) catch |err| {
+            if (self.map.fetchRemove(ip)) |kv| {
+                self.allocator.free(kv.key);
+                freeEntryFields(self.allocator, kv.value);
+            }
+            return err;
+        };
     }
 
     /// Rewrite the file to remove duplicate/stale lines if it has grown too large.
@@ -247,6 +260,23 @@ fn tsField(v: ?std.json.Value) i64 {
         else => {},
     };
     return 0;
+}
+
+fn makeEntry(allocator: Allocator, info: ipinfo.IpInfo) !Entry {
+    const ptr_copy = try allocator.dupe(u8, info.ptr);
+    errdefer allocator.free(ptr_copy);
+    const asn_copy = try allocator.dupe(u8, info.asn);
+    errdefer allocator.free(asn_copy);
+    const org_copy = try allocator.dupe(u8, info.asn_org);
+    errdefer allocator.free(org_copy);
+    const country_copy = try allocator.dupe(u8, info.country);
+    return .{
+        .ptr = ptr_copy,
+        .asn = asn_copy,
+        .asn_org = org_copy,
+        .country = country_copy,
+        .ts = std.time.timestamp(),
+    };
 }
 
 pub fn dupEntry(allocator: Allocator, e: Entry) !Entry {

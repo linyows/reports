@@ -157,18 +157,15 @@ fn filenameToHashId(filename: []const u8) []const u8 {
 export fn reports_enrich_ip(ip: [*:0]const u8) ?[*:0]u8 {
     const ip_span = std.mem.span(ip);
 
-    // Use the global cache if it has been initialized (by a prior fetch call).
-    // This avoids DNS lookups for IPs already resolved during fetch.
+    // Hold g_cache_mu across the entire cache access to prevent a use-after-free
+    // if reports_deinit() runs concurrently. Cache.getDup has its own internal
+    // mutex but that doesn't protect the g_cache pointer itself.
     g_cache_mu.lock();
-    const have_cache = g_cache != null;
-    g_cache_mu.unlock();
-
-    if (have_cache) {
-        if (g_cache.?.getDup(ip_span)) |entry| {
+    if (g_cache) |*c| {
+        if (c.getDup(ip_span)) |entry| {
+            g_cache_mu.unlock();
             defer reports.enrichcache.freeEntryFields(allocator, entry);
-            const info = reports.enrichcache.entryToIpInfo(allocator, entry) catch {
-                return fallbackEnrich(ip_span);
-            };
+            const info = reports.enrichcache.entryToIpInfo(allocator, entry) catch return null;
             defer info.deinit(allocator);
 
             const json = info.toJson(allocator) catch return null;
@@ -177,19 +174,16 @@ export fn reports_enrich_ip(ip: [*:0]const u8) ?[*:0]u8 {
             return result.ptr;
         }
     }
+    g_cache_mu.unlock();
 
-    return fallbackEnrich(ip_span);
-}
-
-fn fallbackEnrich(ip: []const u8) ?[*:0]u8 {
-    const info = reports.ipinfo.lookup(allocator, ip);
+    // Cache miss (or no cache): resolve via DNS, then try to write back under lock.
+    const info = reports.ipinfo.lookup(allocator, ip_span);
     defer info.deinit(allocator);
 
-    // If the cache is available, store the freshly resolved result for next time.
     g_cache_mu.lock();
     if (g_cache) |*c| {
         // put() appends to JSONL file directly; no separate save step needed.
-        c.put(ip, info) catch {};
+        c.put(ip_span, info) catch {};
     }
     g_cache_mu.unlock();
 
