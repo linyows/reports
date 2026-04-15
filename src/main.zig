@@ -104,6 +104,63 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, refetch: 
         }) catch "Done.\n";
         stdout_file.writeAll(msg) catch {};
     }
+
+    // After all accounts fetched, enrich every unique source IP in parallel
+    // using the same worker-pool approach as IMAP fetch. Results are cached
+    // persistently at {data_dir}/.enrich_cache.json for future runs.
+    enrichAllIps(allocator, &cfg) catch {};
+}
+
+fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
+    const names = try cfg.accountNames(allocator);
+    defer allocator.free(names);
+
+    const ips = try reports.fetch.collectSourceIps(allocator, cfg.data_dir, names);
+    defer reports.fetch.freeIpList(allocator, ips);
+
+    if (ips.len == 0) return;
+
+    var cache = try reports.enrichcache.Cache.init(allocator, cfg.data_dir);
+    defer cache.deinit();
+
+    // Count how many need fresh DNS lookups so the progress bar is meaningful.
+    var pending: usize = 0;
+    for (ips) |ip| {
+        if (!cache.hasFresh(ip)) pending += 1;
+    }
+
+    {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "\nEnriching {d} IPs ({d} cached, {d} new)...\n", .{
+            ips.len, ips.len - pending, pending,
+        }) catch "\nEnriching IPs...\n";
+        stdout_file.writeAll(msg) catch {};
+    }
+
+    if (pending == 0) return;
+
+    var progress = std.atomic.Value(usize).init(0);
+
+    const Spawner = struct {
+        fn run(c: *reports.enrichcache.Cache, a: std.mem.Allocator, batch: []const []const u8, p: *std.atomic.Value(usize)) void {
+            reports.enrichcache.enrichParallel(c, a, batch, p);
+        }
+    };
+
+    const thread = std.Thread.spawn(.{}, Spawner.run, .{ &cache, allocator, ips, &progress }) catch {
+        reports.enrichcache.enrichParallel(&cache, allocator, ips, &progress);
+        return;
+    };
+
+    while (progress.load(.monotonic) < ips.len) {
+        var pbuf: [64]u8 = undefined;
+        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]", .{ progress.load(.monotonic), ips.len }) catch "";
+        stderr_file.writeAll(prog) catch {};
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+    }
+    thread.join();
+    stderr_file.writeAll("\r\x1b[K") catch {};
+    stdout_file.writeAll("Enrichment complete.\n") catch {};
 }
 
 fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8, refetch: bool) struct { dmarc: u32, tls: u32 } {

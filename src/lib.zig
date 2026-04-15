@@ -5,12 +5,32 @@ const reports = @import("reports");
 
 const allocator = std.heap.c_allocator;
 
+/// Lazily-initialized global enrich cache, shared by reports_enrich_ip and reports_fetch.
+var g_cache: ?reports.enrichcache.Cache = null;
+var g_cache_mu: std.Thread.Mutex = .{};
+
+fn getCache(data_dir: []const u8) ?*reports.enrichcache.Cache {
+    g_cache_mu.lock();
+    defer g_cache_mu.unlock();
+    if (g_cache == null) {
+        g_cache = reports.enrichcache.Cache.init(allocator, data_dir) catch return null;
+    }
+    return &g_cache.?;
+}
+
 export fn reports_init() void {
     reports.imap.globalInit();
 }
 
 export fn reports_deinit() void {
     reports.imap.globalCleanup();
+    g_cache_mu.lock();
+    defer g_cache_mu.unlock();
+    if (g_cache) |*c| {
+        c.compactIfNeeded() catch {};
+        c.deinit();
+        g_cache = null;
+    }
 }
 
 export fn reports_fetch(config_json: [*:0]const u8) c_int {
@@ -56,6 +76,18 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
         defer reports.fetch.freeResults(allocator, results);
 
         _ = reports.fetch.processResults(allocator, results, &st, &fetched_set);
+    }
+
+    // After all messages fetched and reports saved, enrich every unique source IP
+    // in parallel using the same worker-pool pattern as IMAP fetch.
+    if (getCache(cfg.data_dir)) |cache| {
+        const names = cfg.accountNames(allocator) catch return 0;
+        defer allocator.free(names);
+
+        const ips = reports.fetch.collectSourceIps(allocator, cfg.data_dir, names) catch return 0;
+        defer reports.fetch.freeIpList(allocator, ips);
+
+        reports.enrichcache.enrichParallel(cache, allocator, ips, null);
     }
 
     return 0;
@@ -124,12 +156,45 @@ fn filenameToHashId(filename: []const u8) []const u8 {
 
 export fn reports_enrich_ip(ip: [*:0]const u8) ?[*:0]u8 {
     const ip_span = std.mem.span(ip);
-    const info = reports.ipinfo.lookup(allocator, ip_span);
+
+    // Use the global cache if it has been initialized (by a prior fetch call).
+    // This avoids DNS lookups for IPs already resolved during fetch.
+    g_cache_mu.lock();
+    const have_cache = g_cache != null;
+    g_cache_mu.unlock();
+
+    if (have_cache) {
+        if (g_cache.?.getDup(ip_span)) |entry| {
+            defer reports.enrichcache.freeEntryFields(allocator, entry);
+            const info = reports.enrichcache.entryToIpInfo(allocator, entry) catch {
+                return fallbackEnrich(ip_span);
+            };
+            defer info.deinit(allocator);
+
+            const json = info.toJson(allocator) catch return null;
+            defer allocator.free(json);
+            const result = allocator.dupeZ(u8, json) catch return null;
+            return result.ptr;
+        }
+    }
+
+    return fallbackEnrich(ip_span);
+}
+
+fn fallbackEnrich(ip: []const u8) ?[*:0]u8 {
+    const info = reports.ipinfo.lookup(allocator, ip);
     defer info.deinit(allocator);
+
+    // If the cache is available, store the freshly resolved result for next time.
+    g_cache_mu.lock();
+    if (g_cache) |*c| {
+        // put() appends to JSONL file directly; no separate save step needed.
+        c.put(ip, info) catch {};
+    }
+    g_cache_mu.unlock();
 
     const json = info.toJson(allocator) catch return null;
     defer allocator.free(json);
-
     const result = allocator.dupeZ(u8, json) catch return null;
     return result.ptr;
 }
