@@ -8,13 +8,18 @@ final class ReportsViewModel: ObservableObject {
     @Published var detailJSON: String?
     @Published var isFetching = false
     @Published var isLoading = false
+    @Published var isLoadingDetail = false
     @Published var errorMessage: String?
     @Published var filterType: ReportType?
     @Published var filterAccount: String?
     @Published var filterDomain: String?
     @Published var searchText = ""
+    @Published var showDashboard = true
+    @Published var enrichments: [String: IpEnrichment] = [:]
 
     private let core = ReportsCore.shared
+    private var enrichmentTask: Task<Void, Never>?
+    private var detailTask: Task<Void, Never>?
 
     var selectedEntry: ReportEntry? {
         guard let id = selectedEntryID else { return nil }
@@ -62,6 +67,16 @@ final class ReportsViewModel: ObservableObject {
         filterType = nil
         filterAccount = nil
         filterDomain = nil
+        showDashboard = false
+    }
+
+    func selectDashboard() {
+        filterType = nil
+        filterAccount = nil
+        filterDomain = nil
+        selectedEntryID = nil
+        detailJSON = nil
+        showDashboard = true
     }
 
     func loadReports() {
@@ -88,13 +103,74 @@ final class ReportsViewModel: ObservableObject {
     }
 
     func loadDetail(for entry: ReportEntry) {
+        // Cancel any in-flight work for the previous selection
+        detailTask?.cancel()
+        enrichmentTask?.cancel()
+
         selectedEntryID = entry.id
         detailJSON = nil
-        core.clearEnrichCache()
-        do {
-            detailJSON = try core.show(type: entry.type, account: entry.account, filename: entry.filename)
-        } catch {
-            errorMessage = error.localizedDescription
+        isLoadingDetail = true
+
+        detailTask = Task { [weak self] in
+            guard let self else { return }
+            let json: String? = await Task.detached(priority: .userInitiated) { [core] in
+                try? core.show(type: entry.type, account: entry.account, filename: entry.filename)
+            }.value
+
+            if Task.isCancelled { return }
+
+            await MainActor.run {
+                self.detailJSON = json
+                self.isLoadingDetail = false
+            }
+
+            if let json {
+                let ips = Self.extractIPs(from: json, type: entry.type)
+                self.startEnrichment(for: ips)
+            }
+        }
+    }
+
+    func closeDetail() {
+        detailTask?.cancel()
+        enrichmentTask?.cancel()
+        selectedEntryID = nil
+        detailJSON = nil
+        isLoadingDetail = false
+    }
+
+    /// Extract unique source IPs from the report JSON for background enrichment.
+    private static func extractIPs(from json: String, type: ReportType) -> [String] {
+        guard let data = json.data(using: .utf8) else { return [] }
+        switch type {
+        case .dmarc:
+            guard let report = try? JSONDecoder().decode(DmarcDetail.self, from: data) else { return [] }
+            return Array(Set(report.records.map(\.source_ip).filter { !$0.isEmpty }))
+        case .tlsrpt:
+            guard let report = try? JSONDecoder().decode(TlsDetail.self, from: data) else { return [] }
+            let ips = report.policies.flatMap { $0.failures.map(\.sending_mta_ip) }
+            return Array(Set(ips.filter { !$0.isEmpty }))
+        }
+    }
+
+    /// Resolve enrichments off the main thread, publishing each result as it completes.
+    private func startEnrichment(for ips: [String]) {
+        let pending = ips.filter { enrichments[$0] == nil }
+        guard !pending.isEmpty else { return }
+
+        enrichmentTask = Task { [weak self, core] in
+            for ip in pending {
+                if Task.isCancelled { return }
+                let result = await Task.detached(priority: .userInitiated) {
+                    core.enrichIP(ip)
+                }.value
+                if Task.isCancelled { return }
+                if let result {
+                    await MainActor.run {
+                        self?.enrichments[ip] = result
+                    }
+                }
+            }
         }
     }
 }
