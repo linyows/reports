@@ -9,11 +9,6 @@ struct OrgCount: Identifiable, Hashable {
     var id: String { org }
 }
 
-struct CategoryCount: Identifiable, Hashable {
-    let category: String
-    let count: UInt64
-    var id: String { category }
-}
 
 struct DomainAuthStat: Identifiable, Hashable {
     let domain: String
@@ -53,11 +48,8 @@ struct DashboardStats {
     var tlsrptOrgs: [OrgCount] = []
 
     var domainAuth: [DomainAuthStat] = []
-    var dmarcDispositions: [CategoryCount] = []
 
     var domainTls: [DomainTlsStat] = []
-    var tlsPolicyTypes: [CategoryCount] = []
-    var tlsFailureTypes: [CategoryCount] = []
 
     // Check summary
     var dmarcReports: Int = 0
@@ -69,7 +61,7 @@ struct DashboardStats {
     var tlsTotalFailure: UInt64 = 0
 
     var hasDmarc: Bool { !domainAuth.isEmpty }
-    var hasTlsrpt: Bool { !domainTls.isEmpty || !tlsPolicyTypes.isEmpty }
+    var hasTlsrpt: Bool { !domainTls.isEmpty }
 
     var dmarcFailRate: Int {
         dmarcTotal > 0 ? Int(dmarcFail * 100 / dmarcTotal) : 0
@@ -132,10 +124,6 @@ final class DashboardStatsLoader: ObservableObject {
         var newStats = DashboardStats()
         newStats.dmarcOrgs = dash.dmarc_orgs.sorted { $0.v > $1.v }.map { OrgCount(org: $0.k, count: Int($0.v)) }
         newStats.tlsrptOrgs = dash.tlsrpt_orgs.sorted { $0.v > $1.v }.map { OrgCount(org: $0.k, count: Int($0.v)) }
-        newStats.dmarcDispositions = dash.dispositions.sorted { $0.v > $1.v }.map { CategoryCount(category: $0.k, count: $0.v) }
-        newStats.tlsPolicyTypes = dash.tls_policy_types.sorted { $0.v > $1.v }.map { CategoryCount(category: $0.k, count: $0.v) }
-        newStats.tlsFailureTypes = dash.tls_failure_types.sorted { $0.v > $1.v }.map { CategoryCount(category: $0.k, count: $0.v) }
-
         newStats.domainAuth = dash.domain_auth.map {
             DomainAuthStat(domain: $0.domain, dkimPass: $0.dkim_pass, dkimFail: $0.dkim_fail, spfPass: $0.spf_pass, spfFail: $0.spf_fail, dispNone: $0.disp_none, dispQuarantine: $0.disp_quarantine, dispReject: $0.disp_reject)
         }.sorted { ($0.dkimTotal + $0.spfTotal) > ($1.dkimTotal + $1.spfTotal) }
@@ -631,43 +619,6 @@ struct DashboardView: View {
     // MARK: - Category bar (aggregate distribution)
 
     @ViewBuilder
-    private func categoryBar(data: [CategoryCount], colorFor: @escaping (String) -> Color) -> some View {
-        let total = data.reduce(UInt64(0)) { $0 + $1.count }
-        if total == 0 {
-            emptyPlaceholder(height: 60)
-        } else {
-            VStack(alignment: .leading, spacing: 8) {
-                Chart(data) { item in
-                    BarMark(x: .value("Count", item.count))
-                        .foregroundStyle(colorFor(item.category))
-                }
-                .chartXAxis(.hidden)
-                .chartYAxis(.hidden)
-                .chartPlotStyle { plot in
-                    plot.clipShape(RoundedRectangle(cornerRadius: 4))
-                }
-                .frame(height: 20)
-
-                FlowLayout(spacing: 10) {
-                    ForEach(data) { item in
-                        HStack(spacing: 4) {
-                            Circle().fill(colorFor(item.category)).frame(width: 8, height: 8)
-                            Text(item.category).font(.caption.monospaced())
-                            Text("\(item.count)")
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                            let pct = Double(item.count) / Double(total) * 100
-                            Text("(\(String(format: "%.1f", pct))%)")
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
     private func emptyPlaceholder(height: CGFloat) -> some View {
         Text("No data")
             .font(.caption)
@@ -719,47 +670,3 @@ private func failureColor(_ type: String) -> Color {
     return .gray
 }
 
-// MARK: - Flow Layout
-
-struct FlowLayout: Layout {
-    var spacing: CGFloat = 8
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let width = proposal.width ?? .infinity
-        var x: CGFloat = 0
-        var y: CGFloat = 0
-        var rowHeight: CGFloat = 0
-        var maxWidth: CGFloat = 0
-
-        for view in subviews {
-            let size = view.sizeThatFits(.unspecified)
-            if x + size.width > width && x > 0 {
-                x = 0
-                y += rowHeight + spacing
-                rowHeight = 0
-            }
-            x += size.width + spacing
-            maxWidth = max(maxWidth, x)
-            rowHeight = max(rowHeight, size.height)
-        }
-        return CGSize(width: min(maxWidth, width), height: y + rowHeight)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var x = bounds.minX
-        var y = bounds.minY
-        var rowHeight: CGFloat = 0
-
-        for view in subviews {
-            let size = view.sizeThatFits(.unspecified)
-            if x + size.width > bounds.maxX && x > bounds.minX {
-                x = bounds.minX
-                y += rowHeight + spacing
-                rowHeight = 0
-            }
-            view.place(at: CGPoint(x: x, y: y), proposal: .unspecified)
-            x += size.width + spacing
-            rowHeight = max(rowHeight, size.height)
-        }
-    }
-}
