@@ -75,11 +75,10 @@ final class ReportsViewModel: ObservableObject {
     }
 
     func selectDashboard() {
+        closeDetail()
         filterType = nil
         filterAccount = nil
         filterDomain = nil
-        selectedEntryID = nil
-        detailJSON = nil
         showDashboard = true
     }
 
@@ -127,6 +126,9 @@ final class ReportsViewModel: ObservableObject {
             await MainActor.run {
                 self.detailJSON = json
                 self.isLoadingDetail = false
+                if json == nil {
+                    self.errorMessage = "Failed to load report"
+                }
             }
 
             if let json {

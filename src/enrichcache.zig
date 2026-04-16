@@ -138,9 +138,9 @@ pub const Cache = struct {
         const line = try formatLine(self.allocator, ip, entry);
         defer self.allocator.free(line);
 
-        const file = std.fs.createFileAbsolute(self.path, .{ .truncate = false }) catch return;
+        const file = try std.fs.createFileAbsolute(self.path, .{ .truncate = false });
         defer file.close();
-        file.seekFromEnd(0) catch {};
+        try file.seekFromEnd(0);
         try file.writeAll(line);
 
         self.appended_since_compact += 1;
@@ -196,11 +196,27 @@ pub const Cache = struct {
             const ip = ip_val.string;
             if (ip.len == 0) continue;
 
+            const ptr_f = dupStrField(self.allocator, obj.get("ptr")) catch continue;
+            const asn_f = dupStrField(self.allocator, obj.get("asn")) catch {
+                self.allocator.free(ptr_f);
+                continue;
+            };
+            const org_f = dupStrField(self.allocator, obj.get("asn_org")) catch {
+                self.allocator.free(ptr_f);
+                self.allocator.free(asn_f);
+                continue;
+            };
+            const country_f = dupStrField(self.allocator, obj.get("country")) catch {
+                self.allocator.free(ptr_f);
+                self.allocator.free(asn_f);
+                self.allocator.free(org_f);
+                continue;
+            };
             const entry = Entry{
-                .ptr = dupStrField(self.allocator, obj.get("ptr")) catch continue,
-                .asn = dupStrField(self.allocator, obj.get("asn")) catch continue,
-                .asn_org = dupStrField(self.allocator, obj.get("asn_org")) catch continue,
-                .country = dupStrField(self.allocator, obj.get("country")) catch continue,
+                .ptr = ptr_f,
+                .asn = asn_f,
+                .asn_org = org_f,
+                .country = country_f,
                 .ts = tsField(obj.get("ts")),
             };
 

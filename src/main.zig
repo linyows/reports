@@ -107,7 +107,7 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, refetch: 
 
     // After all accounts fetched, enrich every unique source IP in parallel
     // using the same worker-pool approach as IMAP fetch. Results are cached
-    // persistently at {data_dir}/.enrich_cache.json for future runs.
+    // persistently at {data_dir}/.enrich_cache.jsonl (JSON Lines) for future runs.
     enrichAllIps(allocator, &cfg) catch {};
 }
 
