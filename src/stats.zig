@@ -425,3 +425,175 @@ test "aggregateTlsReport handles invalid JSON gracefully" {
     aggregateTlsReport(alloc, "not json", "fallback.com", &domain_tls, &tls_pt, &tls_ft, &dom_pt, &dom_ft);
     try std.testing.expectEqual(@as(u32, 0), domain_tls.count());
 }
+
+test "aggregateDmarcReport accumulates across multiple calls for same domain" {
+    const alloc = std.testing.allocator;
+    const json1 =
+        \\{"policy":{"domain":"example.com"},"records":[
+        \\  {"count":10,"dkim_eval":"pass","spf_eval":"pass","disposition":"none"}
+        \\]}
+    ;
+    const json2 =
+        \\{"policy":{"domain":"example.com"},"records":[
+        \\  {"count":5,"dkim_eval":"fail","spf_eval":"fail","disposition":"reject"},
+        \\  {"count":3,"dkim_eval":"pass","spf_eval":"pass","disposition":"none"}
+        \\]}
+    ;
+
+    var domain_auth = std.StringHashMap(DashAgg).init(alloc);
+    defer {
+        var it = domain_auth.iterator();
+        while (it.next()) |kv| alloc.free(kv.key_ptr.*);
+        domain_auth.deinit();
+    }
+    var dispositions = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &dispositions);
+
+    aggregateDmarcReport(alloc, json1, "fallback.com", &domain_auth, &dispositions);
+    aggregateDmarcReport(alloc, json2, "fallback.com", &domain_auth, &dispositions);
+
+    const agg = domain_auth.get("example.com").?;
+    try std.testing.expectEqual(@as(u64, 13), agg.dkim_pass); // 10 + 3
+    try std.testing.expectEqual(@as(u64, 5), agg.dkim_fail);
+    try std.testing.expectEqual(@as(u64, 13), agg.spf_pass); // 10 + 3
+    try std.testing.expectEqual(@as(u64, 5), agg.spf_fail);
+    try std.testing.expectEqual(@as(u64, 13), agg.disp_none); // 10 + 3
+    try std.testing.expectEqual(@as(u64, 5), agg.disp_reject);
+    try std.testing.expectEqual(@as(u64, 13), dispositions.get("none").?);
+    try std.testing.expectEqual(@as(u64, 5), dispositions.get("reject").?);
+}
+
+test "aggregateDmarcReport accumulates multiple domains separately" {
+    const alloc = std.testing.allocator;
+    const json1 =
+        \\{"policy":{"domain":"a.com"},"records":[
+        \\  {"count":10,"dkim_eval":"pass","spf_eval":"pass"}
+        \\]}
+    ;
+    const json2 =
+        \\{"policy":{"domain":"b.com"},"records":[
+        \\  {"count":7,"dkim_eval":"fail","spf_eval":"fail"}
+        \\]}
+    ;
+
+    var domain_auth = std.StringHashMap(DashAgg).init(alloc);
+    defer {
+        var it = domain_auth.iterator();
+        while (it.next()) |kv| alloc.free(kv.key_ptr.*);
+        domain_auth.deinit();
+    }
+    var dispositions = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &dispositions);
+
+    aggregateDmarcReport(alloc, json1, "fallback.com", &domain_auth, &dispositions);
+    aggregateDmarcReport(alloc, json2, "fallback.com", &domain_auth, &dispositions);
+
+    try std.testing.expectEqual(@as(u32, 2), domain_auth.count());
+    try std.testing.expectEqual(@as(u64, 10), domain_auth.get("a.com").?.dkim_pass);
+    try std.testing.expectEqual(@as(u64, 7), domain_auth.get("b.com").?.dkim_fail);
+}
+
+test "aggregateTlsReport accumulates across multiple calls" {
+    const alloc = std.testing.allocator;
+    const json1 =
+        \\{"policies":[
+        \\  {"policy_domain":"mx.example.com","policy_type":"sts","total_successful":100,"total_failure":0}
+        \\]}
+    ;
+    const json2 =
+        \\{"policies":[
+        \\  {"policy_domain":"mx.example.com","policy_type":"sts","total_successful":50,"total_failure":3,
+        \\   "failures":[{"result_type":"certificate-expired","failed_session_count":3}]}
+        \\]}
+    ;
+
+    var domain_tls = std.StringHashMap(TlsDomAgg).init(alloc);
+    defer {
+        var it = domain_tls.iterator();
+        while (it.next()) |kv| alloc.free(kv.key_ptr.*);
+        domain_tls.deinit();
+    }
+    var tls_pt = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &tls_pt);
+    var tls_ft = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &tls_ft);
+    var dom_pt = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &dom_pt);
+    var dom_ft = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &dom_ft);
+
+    aggregateTlsReport(alloc, json1, "fallback.com", &domain_tls, &tls_pt, &tls_ft, &dom_pt, &dom_ft);
+    aggregateTlsReport(alloc, json2, "fallback.com", &domain_tls, &tls_pt, &tls_ft, &dom_pt, &dom_ft);
+
+    const tls = domain_tls.get("mx.example.com").?;
+    try std.testing.expectEqual(@as(u64, 150), tls.success); // 100 + 50
+    try std.testing.expectEqual(@as(u64, 3), tls.failure);
+    try std.testing.expectEqual(@as(u64, 253), tls_pt.get("sts").?); // 100 + 50 + 53
+    try std.testing.expectEqual(@as(u64, 3), tls_ft.get("certificate-expired").?);
+    try std.testing.expectEqual(@as(u64, 253), dom_pt.get("mx.example.com\x00sts").?);
+    try std.testing.expectEqual(@as(u64, 3), dom_ft.get("mx.example.com\x00certificate-expired").?);
+}
+
+test "aggregateTlsReport handles multiple domains and failure types" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"policies":[
+        \\  {"policy_domain":"a.com","policy_type":"sts","total_successful":50,"total_failure":2,
+        \\   "failures":[{"result_type":"starttls-not-supported","failed_session_count":2}]},
+        \\  {"policy_domain":"b.com","policy_type":"tlsa","total_successful":30,"total_failure":5,
+        \\   "failures":[
+        \\     {"result_type":"certificate-expired","failed_session_count":3},
+        \\     {"result_type":"validation-failure","failed_session_count":2}
+        \\   ]}
+        \\]}
+    ;
+
+    var domain_tls = std.StringHashMap(TlsDomAgg).init(alloc);
+    defer {
+        var it = domain_tls.iterator();
+        while (it.next()) |kv| alloc.free(kv.key_ptr.*);
+        domain_tls.deinit();
+    }
+    var tls_pt = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &tls_pt);
+    var tls_ft = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &tls_ft);
+    var dom_pt = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &dom_pt);
+    var dom_ft = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &dom_ft);
+
+    aggregateTlsReport(alloc, json, "fallback.com", &domain_tls, &tls_pt, &tls_ft, &dom_pt, &dom_ft);
+
+    // Two separate domains
+    try std.testing.expectEqual(@as(u32, 2), domain_tls.count());
+    try std.testing.expectEqual(@as(u64, 50), domain_tls.get("a.com").?.success);
+    try std.testing.expectEqual(@as(u64, 30), domain_tls.get("b.com").?.success);
+    try std.testing.expectEqual(@as(u64, 5), domain_tls.get("b.com").?.failure);
+
+    // Global policy types
+    try std.testing.expectEqual(@as(u64, 52), tls_pt.get("sts").?); // 50+2
+    try std.testing.expectEqual(@as(u64, 35), tls_pt.get("tlsa").?); // 30+5
+
+    // Global failure types
+    try std.testing.expectEqual(@as(u64, 2), tls_ft.get("starttls-not-supported").?);
+    try std.testing.expectEqual(@as(u64, 3), tls_ft.get("certificate-expired").?);
+    try std.testing.expectEqual(@as(u64, 2), tls_ft.get("validation-failure").?);
+
+    // Per-domain compound keys
+    try std.testing.expectEqual(@as(u64, 52), dom_pt.get("a.com\x00sts").?);
+    try std.testing.expectEqual(@as(u64, 35), dom_pt.get("b.com\x00tlsa").?);
+    try std.testing.expectEqual(@as(u64, 2), dom_ft.get("a.com\x00starttls-not-supported").?);
+    try std.testing.expectEqual(@as(u64, 3), dom_ft.get("b.com\x00certificate-expired").?);
+    try std.testing.expectEqual(@as(u64, 2), dom_ft.get("b.com\x00validation-failure").?);
+}
+
+test "hashIncOwned handles empty string key" {
+    const alloc = std.testing.allocator;
+    var map = std.StringHashMap(u64).init(alloc);
+    defer freeMapKeys(alloc, &map);
+
+    hashIncOwned(alloc, &map, "", 5);
+    hashIncOwned(alloc, &map, "", 3);
+    try std.testing.expectEqual(@as(u64, 8), map.get("").?);
+}
