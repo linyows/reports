@@ -108,7 +108,13 @@ export fn reports_fetch_account(config_json: [*:0]const u8, account_name: [*:0]c
         if (acct.host.len == 0) return errStr("Host is empty");
 
         var client = reports.imap.Client.init(
-            allocator, acct.host, acct.port, acct.username, acct.password, acct.mailbox, acct.tls,
+            allocator,
+            acct.host,
+            acct.port,
+            acct.username,
+            acct.password,
+            acct.mailbox,
+            acct.tls,
         );
         client.connect() catch return errStr("Failed to initialize IMAP client");
         defer client.deinit();
@@ -312,27 +318,63 @@ const TlsDomAgg = struct {
 fn buildDashboardJson(data_dir: []const u8, entries: []const reports.store.ReportEntry) ?[]const u8 {
     // Accumulators using owned keys
     var dmarc_orgs = std.StringHashMap(u64).init(allocator);
-    defer { var it = dmarc_orgs.iterator(); while (it.next()) |kv| allocator.free(kv.key_ptr.*); dmarc_orgs.deinit(); }
+    defer {
+        var it = dmarc_orgs.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        dmarc_orgs.deinit();
+    }
     var tlsrpt_orgs = std.StringHashMap(u64).init(allocator);
-    defer { var it = tlsrpt_orgs.iterator(); while (it.next()) |kv| allocator.free(kv.key_ptr.*); tlsrpt_orgs.deinit(); }
+    defer {
+        var it = tlsrpt_orgs.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        tlsrpt_orgs.deinit();
+    }
 
     var domain_auth = std.StringHashMap(DashAgg).init(allocator);
-    defer { var it = domain_auth.iterator(); while (it.next()) |kv| allocator.free(kv.key_ptr.*); domain_auth.deinit(); }
+    defer {
+        var it = domain_auth.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        domain_auth.deinit();
+    }
     var dispositions = std.StringHashMap(u64).init(allocator);
-    defer { var it = dispositions.iterator(); while (it.next()) |kv| allocator.free(kv.key_ptr.*); dispositions.deinit(); }
+    defer {
+        var it = dispositions.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        dispositions.deinit();
+    }
 
     var domain_tls = std.StringHashMap(TlsDomAgg).init(allocator);
-    defer { var it = domain_tls.iterator(); while (it.next()) |kv| allocator.free(kv.key_ptr.*); domain_tls.deinit(); }
+    defer {
+        var it = domain_tls.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        domain_tls.deinit();
+    }
     // "domain\x00policy_type" -> count for per-domain policy type breakdown
     var domain_policy_types = std.StringHashMap(u64).init(allocator);
-    defer { var it2 = domain_policy_types.iterator(); while (it2.next()) |kv| allocator.free(kv.key_ptr.*); domain_policy_types.deinit(); }
+    defer {
+        var it2 = domain_policy_types.iterator();
+        while (it2.next()) |kv| allocator.free(kv.key_ptr.*);
+        domain_policy_types.deinit();
+    }
     // "domain\x00failure_type" -> count
     var domain_failure_types = std.StringHashMap(u64).init(allocator);
-    defer { var it3 = domain_failure_types.iterator(); while (it3.next()) |kv| allocator.free(kv.key_ptr.*); domain_failure_types.deinit(); }
+    defer {
+        var it3 = domain_failure_types.iterator();
+        while (it3.next()) |kv| allocator.free(kv.key_ptr.*);
+        domain_failure_types.deinit();
+    }
     var tls_policy_types = std.StringHashMap(u64).init(allocator);
-    defer { var it = tls_policy_types.iterator(); while (it.next()) |kv| allocator.free(kv.key_ptr.*); tls_policy_types.deinit(); }
+    defer {
+        var it = tls_policy_types.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        tls_policy_types.deinit();
+    }
     var tls_failure_types = std.StringHashMap(u64).init(allocator);
-    defer { var it = tls_failure_types.iterator(); while (it.next()) |kv| allocator.free(kv.key_ptr.*); tls_failure_types.deinit(); }
+    defer {
+        var it = tls_failure_types.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        tls_failure_types.deinit();
+    }
 
     for (entries) |entry| {
         const st = reports.store.Store.init(allocator, data_dir, entry.account_name);
@@ -346,7 +388,10 @@ fn buildDashboardJson(data_dir: []const u8, entries: []const reports.store.Repor
                 const domain = if (parsed.value.policy.domain.len > 0) parsed.value.policy.domain else entry.domain;
                 for (parsed.value.records) |rec| {
                     const key = allocator.dupe(u8, domain) catch continue;
-                    const gop = domain_auth.getOrPut(key) catch { allocator.free(key); continue; };
+                    const gop = domain_auth.getOrPut(key) catch {
+                        allocator.free(key);
+                        continue;
+                    };
                     if (gop.found_existing) allocator.free(key);
                     if (!gop.found_existing) gop.value_ptr.* = .{};
                     if (std.mem.eql(u8, rec.dkim_eval, "pass")) gop.value_ptr.dkim_pass += rec.count else gop.value_ptr.dkim_fail += rec.count;
@@ -371,7 +416,10 @@ fn buildDashboardJson(data_dir: []const u8, entries: []const reports.store.Repor
                 for (parsed.value.policies) |pol| {
                     const domain = if (pol.policy_domain.len > 0) pol.policy_domain else entry.domain;
                     const dk = allocator.dupe(u8, domain) catch continue;
-                    const gop = domain_tls.getOrPut(dk) catch { allocator.free(dk); continue; };
+                    const gop = domain_tls.getOrPut(dk) catch {
+                        allocator.free(dk);
+                        continue;
+                    };
                     if (gop.found_existing) allocator.free(dk);
                     if (!gop.found_existing) gop.value_ptr.* = .{};
                     gop.value_ptr.success += pol.total_successful;
@@ -380,7 +428,10 @@ fn buildDashboardJson(data_dir: []const u8, entries: []const reports.store.Repor
                     hashIncOwned(&tls_policy_types, pt, pol.total_successful + pol.total_failure);
                     // Per-domain policy type: "domain\x00type"
                     const dpt_key = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ domain, pt }) catch continue;
-                    const dpt_gop = domain_policy_types.getOrPut(dpt_key) catch { allocator.free(dpt_key); continue; };
+                    const dpt_gop = domain_policy_types.getOrPut(dpt_key) catch {
+                        allocator.free(dpt_key);
+                        continue;
+                    };
                     if (dpt_gop.found_existing) allocator.free(dpt_key);
                     if (!dpt_gop.found_existing) dpt_gop.value_ptr.* = 0;
                     dpt_gop.value_ptr.* += pol.total_successful + pol.total_failure;
@@ -390,7 +441,10 @@ fn buildDashboardJson(data_dir: []const u8, entries: []const reports.store.Repor
                         hashIncOwned(&tls_failure_types, ft, f.failed_session_count);
                         // Per-domain failure type
                         const dft_key = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ domain, ft }) catch continue;
-                        const dft_gop = domain_failure_types.getOrPut(dft_key) catch { allocator.free(dft_key); continue; };
+                        const dft_gop = domain_failure_types.getOrPut(dft_key) catch {
+                            allocator.free(dft_key);
+                            continue;
+                        };
                         if (dft_gop.found_existing) allocator.free(dft_key);
                         if (!dft_gop.found_existing) dft_gop.value_ptr.* = 0;
                         dft_gop.value_ptr.* += f.failed_session_count;
@@ -424,7 +478,7 @@ fn buildDashboardJson(data_dir: []const u8, entries: []const reports.store.Repor
             if (!first) buf.appendSlice(allocator, ",") catch return null;
             first = false;
             const line = std.fmt.allocPrint(allocator, "{{\"domain\":\"{s}\",\"dkim_pass\":{d},\"dkim_fail\":{d},\"spf_pass\":{d},\"spf_fail\":{d},\"disp_none\":{d},\"disp_quarantine\":{d},\"disp_reject\":{d}}}", .{
-                kv.key_ptr.*, kv.value_ptr.dkim_pass, kv.value_ptr.dkim_fail, kv.value_ptr.spf_pass, kv.value_ptr.spf_fail,
+                kv.key_ptr.*,           kv.value_ptr.dkim_pass,       kv.value_ptr.dkim_fail,   kv.value_ptr.spf_pass, kv.value_ptr.spf_fail,
                 kv.value_ptr.disp_none, kv.value_ptr.disp_quarantine, kv.value_ptr.disp_reject,
             }) catch continue;
             defer allocator.free(line);
@@ -502,7 +556,10 @@ fn buildDashboardJson(data_dir: []const u8, entries: []const reports.store.Repor
 
 fn hashIncOwned(map: *std.StringHashMap(u64), key: []const u8, val: u64) void {
     const duped = allocator.dupe(u8, key) catch return;
-    const gop = map.getOrPut(duped) catch { allocator.free(duped); return; };
+    const gop = map.getOrPut(duped) catch {
+        allocator.free(duped);
+        return;
+    };
     if (gop.found_existing) {
         allocator.free(duped);
         gop.value_ptr.* += val;
