@@ -128,13 +128,15 @@ fn cmdAggregate(allocator: std.mem.Allocator) !void {
     const names = cfg.accountNames(allocator) catch return;
     defer allocator.free(names);
 
-    const ips = reports.fetch.collectSourceIps(allocator, cfg.data_dir, names) catch return;
-    defer reports.fetch.freeIpList(allocator, ips);
-
     const entries = reports.store.listAllReports(allocator, cfg.data_dir, names) catch return;
     defer reports.store.freeReportEntries(allocator, entries);
 
-    // Delete old caches so they are rebuilt on next access
+    const ips = reports.fetch.collectSourceIps(allocator, cfg.data_dir, names) catch return;
+    defer reports.fetch.freeIpList(allocator, ips);
+
+    // Invalidate caches — the macOS app's C API (reports_aggregate) will
+    // rebuild them on next access. The CLI cannot call lib.zig exports
+    // directly, so we delete and let lazy rebuild handle it.
     for ([_][]const u8{ ".sources_cache.json", ".dashboard_cache.json" }) |filename| {
         const path = std.fs.path.join(allocator, &.{ cfg.data_dir, filename }) catch continue;
         defer allocator.free(path);
@@ -142,7 +144,7 @@ fn cmdAggregate(allocator: std.mem.Allocator) !void {
     }
 
     var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "\nAggregated: {d} unique IPs, {d} reports.\n", .{
+    const msg = std.fmt.bufPrint(&buf, "\nAggregated: {d} unique IPs, {d} reports. Caches invalidated.\n", .{
         ips.len, entries.len,
     }) catch "\nAggregation complete.\n";
     stdout_file.writeAll(msg) catch {};

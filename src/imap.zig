@@ -6,7 +6,8 @@ const c = @cImport({
 });
 
 /// Last curl error message (static string from curl_easy_strerror, no need to free).
-var g_last_curl_error: ?[]const u8 = null;
+/// threadlocal to avoid data races when multiple accounts are fetched in parallel.
+threadlocal var g_last_curl_error: ?[]const u8 = null;
 
 pub fn lastCurlError() ?[]const u8 {
     return g_last_curl_error;
