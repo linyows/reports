@@ -23,7 +23,7 @@ struct ReportListView: View {
                     TableColumn("TYPE") { entry in
                         BadgeLabel(
                             text: entry.type.displayName,
-                            color: entry.type == .dmarc ? .orange : Color(.systemTeal)
+                            color: entry.type == .dmarc ? .orange : .blue
                         )
                     }
                     .width(min: 50, ideal: 70)
@@ -46,6 +46,17 @@ struct ReportListView: View {
                     }
                     .width(min: 80, ideal: 150)
 
+                    TableColumn("PROBLEMS") { entry in
+                        if entry.problems > 0 {
+                            BadgeLabel(text: "\(entry.problems)", color: .problemRed)
+                        } else {
+                            Text("0")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .width(min: 50, ideal: 70)
+
                     TableColumn("POLICY") { entry in
                         if !entry.policy.isEmpty {
                             BadgeLabel(text: entry.policy, color: policyColor(entry.policy))
@@ -66,6 +77,9 @@ struct ReportListView: View {
     }
 
     private var navigationTitle: String {
+        if viewModel.filterProblems {
+            return "Problems"
+        }
         if let account = viewModel.filterAccount {
             return account
         }

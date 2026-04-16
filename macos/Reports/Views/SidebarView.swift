@@ -54,6 +54,28 @@ struct SidebarView: View {
                     viewModel.clearFilters()
                     viewModel.filterType = .tlsrpt
                 }
+
+                SidebarButton(
+                    title: "Problems",
+                    icon: "exclamationmark.triangle",
+                    count: viewModel.problemsCount,
+                    color: .problemRed,
+                    isSelected: !viewModel.showDashboard && viewModel.filterProblems
+                ) {
+                    viewModel.clearFilters()
+                    viewModel.filterProblems = true
+                }
+
+                SidebarButton(
+                    title: "Mail Sources",
+                    icon: "network",
+                    count: viewModel.mailSources.count,
+                    color: .primary,
+                    isSelected: viewModel.showMailSources,
+                    isLoading: viewModel.isLoadingSources
+                ) {
+                    viewModel.selectMailSources()
+                }
             }
 
             Section {
@@ -93,16 +115,28 @@ struct SidebarView: View {
         .listStyle(.sidebar)
         .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
         .safeAreaInset(edge: .bottom) {
-            HStack {
-                SettingsLink {
-                    Label("Settings", systemImage: "gearshape")
+            VStack(spacing: 0) {
+                Divider()
+                VStack(spacing: 12) {
+                    Button {
+                        viewModel.showAddAccount = true
+                    } label: {
+                        Label("Add Account", systemImage: "plus.circle")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Add Account (⇧⌘N)")
+
+                    SettingsLink {
+                        Label("Settings", systemImage: "gearshape")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Settings (⌘,)")
                 }
-                .buttonStyle(.borderless)
-                .help("Settings (⌘,)")
-                Spacer()
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
         }
         .navigationTitle("Reports")
         .toolbar {

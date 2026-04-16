@@ -36,9 +36,18 @@ pub fn main() !void {
     const report_type = getOption(args, "--type");
     const enrich = !hasFlag(args, "--no-enrich");
 
-    if (std.mem.eql(u8, command, "fetch")) {
+    if (std.mem.eql(u8, command, "sync")) {
         const refetch = hasFlag(args, "--refetch");
         try cmdFetch(allocator, account, refetch);
+        try cmdEnrich(allocator);
+        try cmdAggregate(allocator);
+    } else if (std.mem.eql(u8, command, "fetch")) {
+        const refetch = hasFlag(args, "--refetch");
+        try cmdFetch(allocator, account, refetch);
+    } else if (std.mem.eql(u8, command, "enrich")) {
+        try cmdEnrich(allocator);
+    } else if (std.mem.eql(u8, command, "aggregate")) {
+        try cmdAggregate(allocator);
     } else if (std.mem.eql(u8, command, "list")) {
         try cmdList(allocator, format orelse "table", domain, account, report_type);
     } else if (std.mem.eql(u8, command, "show")) {
@@ -104,11 +113,41 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, refetch: 
         }) catch "Done.\n";
         stdout_file.writeAll(msg) catch {};
     }
+}
 
-    // After all accounts fetched, enrich every unique source IP in parallel
-    // using the same worker-pool approach as IMAP fetch. Results are cached
-    // persistently at {data_dir}/.enrich_cache.jsonl (JSON Lines) for future runs.
-    enrichAllIps(allocator, &cfg) catch {};
+fn cmdEnrich(allocator: std.mem.Allocator) !void {
+    const cfg = try Config.load(allocator);
+    defer cfg.deinit(allocator);
+    try enrichAllIps(allocator, &cfg);
+}
+
+fn cmdAggregate(allocator: std.mem.Allocator) !void {
+    const cfg = try Config.load(allocator);
+    defer cfg.deinit(allocator);
+
+    const names = cfg.accountNames(allocator) catch return;
+    defer allocator.free(names);
+
+    const entries = reports.store.listAllReports(allocator, cfg.data_dir, names) catch return;
+    defer reports.store.freeReportEntries(allocator, entries);
+
+    const ips = reports.fetch.collectSourceIps(allocator, cfg.data_dir, names) catch return;
+    defer reports.fetch.freeIpList(allocator, ips);
+
+    // Invalidate caches — the macOS app's C API (reports_aggregate) will
+    // rebuild them on next access. The CLI cannot call lib.zig exports
+    // directly, so we delete and let lazy rebuild handle it.
+    for ([_][]const u8{ ".sources_cache.json", ".dashboard_cache.json" }) |filename| {
+        const path = std.fs.path.join(allocator, &.{ cfg.data_dir, filename }) catch continue;
+        defer allocator.free(path);
+        std.fs.deleteFileAbsolute(path) catch {};
+    }
+
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "\nAggregated: {d} unique IPs, {d} reports. Caches invalidated.\n", .{
+        ips.len, entries.len,
+    }) catch "\nAggregation complete.\n";
+    stdout_file.writeAll(msg) catch {};
 }
 
 fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
@@ -300,7 +339,7 @@ fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8
     defer allocator.free(filtered);
 
     if (std.mem.eql(u8, format, "json")) {
-        try writeJsonList(allocator, filtered);
+        try writeJsonList(allocator, cfg.data_dir, filtered);
     } else {
         try writeTableList(allocator, filtered);
     }
@@ -1093,7 +1132,23 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
     }
 }
 
-fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.ReportEntry) !void {
+fn countProblems(alloc: std.mem.Allocator, data_dir: []const u8, entry: reports.store.ReportEntry) u64 {
+    const st = Store.init(alloc, data_dir, entry.account_name);
+    switch (entry.report_type) {
+        .dmarc => {
+            const data = st.loadDmarcReport(entry.filename) catch return 0;
+            defer alloc.free(data);
+            return reports.stats.countDmarcProblems(alloc, data);
+        },
+        .tlsrpt => {
+            const data = st.loadTlsReport(entry.filename) catch return 0;
+            defer alloc.free(data);
+            return reports.stats.countTlsProblems(alloc, data);
+        },
+    }
+}
+
+fn writeJsonList(alloc: std.mem.Allocator, data_dir: []const u8, entries: []const reports.store.ReportEntry) !void {
     stdout_file.writeAll("[") catch {};
     for (entries, 0..) |e, i| {
         if (i > 0) stdout_file.writeAll(",") catch {};
@@ -1102,10 +1157,11 @@ fn writeJsonList(allocator: std.mem.Allocator, entries: []const reports.store.Re
             .tlsrpt => "tlsrpt",
         };
         const hash_id = filenameToHashId(e.filename);
-        const json_entry = try std.fmt.allocPrint(allocator, "\n  {{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\",\"filename\":\"{s}\"}}", .{
-            e.account_name, type_str, e.org_name, hash_id, e.date_begin, e.domain, e.policy, e.filename,
+        const problems = countProblems(alloc, data_dir, e);
+        const json_entry = try std.fmt.allocPrint(alloc, "\n  {{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\",\"filename\":\"{s}\",\"problems\":{d}}}", .{
+            e.account_name, type_str, e.org_name, hash_id, e.date_begin, e.domain, e.policy, e.filename, problems,
         });
-        defer allocator.free(json_entry);
+        defer alloc.free(json_entry);
         stdout_file.writeAll(json_entry) catch {};
     }
     stdout_file.writeAll("\n]\n") catch {};
@@ -1566,7 +1622,10 @@ fn printUsage() void {
         \\Usage: reports <command> [options]
         \\
         \\Commands:
+        \\  sync                         Fetch, enrich, and aggregate (all-in-one)
         \\  fetch                        Fetch reports from IMAP
+        \\  enrich                       Enrich source IPs (PTR/ASN/country)
+        \\  aggregate                    Rebuild dashboard and mail sources caches
         \\  list                         List reports
         \\  show <id>                    Show report details
         \\  summary                      Show summary statistics
