@@ -21,22 +21,31 @@ struct DomainAuthStat: Identifiable, Hashable {
     let dkimFail: UInt64
     let spfPass: UInt64
     let spfFail: UInt64
+    let dispNone: UInt64
+    let dispQuarantine: UInt64
+    let dispReject: UInt64
     var id: String { domain }
 
     var dkimTotal: UInt64 { dkimPass + dkimFail }
     var spfTotal: UInt64 { spfPass + spfFail }
     var dkimPassRatio: Double { dkimTotal > 0 ? Double(dkimPass) / Double(dkimTotal) : 0 }
     var spfPassRatio: Double { spfTotal > 0 ? Double(spfPass) / Double(spfTotal) : 0 }
+    var dispTotal: UInt64 { dispNone + dispQuarantine + dispReject }
 }
 
 struct DomainTlsStat: Identifiable, Hashable {
     let domain: String
     let success: UInt64
     let failure: UInt64
+    let policyTypes: [(name: String, count: UInt64)]
+    let failureTypes: [(name: String, count: UInt64)]
     var id: String { domain }
 
     var total: UInt64 { success + failure }
     var successRatio: Double { total > 0 ? Double(success) / Double(total) : 0 }
+
+    static func == (lhs: DomainTlsStat, rhs: DomainTlsStat) -> Bool { lhs.domain == rhs.domain }
+    func hash(into hasher: inout Hasher) { hasher.combine(domain) }
 }
 
 struct DashboardStats {
@@ -50,8 +59,57 @@ struct DashboardStats {
     var tlsPolicyTypes: [CategoryCount] = []
     var tlsFailureTypes: [CategoryCount] = []
 
+    // Check summary
+    var dmarcReports: Int = 0
+    var dmarcTotal: UInt64 = 0
+    var dmarcPass: UInt64 = 0
+    var dmarcFail: UInt64 = 0
+    var tlsReports: Int = 0
+    var tlsTotalSuccess: UInt64 = 0
+    var tlsTotalFailure: UInt64 = 0
+
     var hasDmarc: Bool { !domainAuth.isEmpty }
     var hasTlsrpt: Bool { !domainTls.isEmpty || !tlsPolicyTypes.isEmpty }
+
+    var dmarcFailRate: Int {
+        dmarcTotal > 0 ? Int(dmarcFail * 100 / dmarcTotal) : 0
+    }
+
+    var dmarcSummary: AttributedString {
+        var s = AttributedString("")
+        var num = AttributedString("\(dmarcReports)")
+        num.font = .body.monospaced().weight(.bold)
+        s += num
+        s += plain(" reports, ")
+        var fail = AttributedString("\(dmarcFail)/\(dmarcTotal)")
+        fail.font = .body.monospaced().weight(.bold)
+        s += fail
+        s += plain(" messages failed (")
+        var rate = AttributedString("\(dmarcFailRate)%")
+        rate.font = .body.monospaced().weight(.bold)
+        s += rate
+        s += plain(")")
+        return s
+    }
+
+    var tlsSummary: AttributedString {
+        var s = AttributedString("")
+        var num = AttributedString("\(tlsReports)")
+        num.font = .body.monospaced().weight(.bold)
+        s += num
+        s += plain(" reports, ")
+        var fail = AttributedString("\(tlsTotalFailure)")
+        fail.font = .body.monospaced().weight(.bold)
+        s += fail
+        s += plain(" failures")
+        return s
+    }
+
+    private func plain(_ str: String) -> AttributedString {
+        var a = AttributedString(str)
+        a.font = .body.monospaced()
+        return a
+    }
 }
 
 // MARK: - Stats Loader
@@ -61,107 +119,48 @@ final class DashboardStatsLoader: ObservableObject {
     @Published var isLoading = false
     @Published var stats = DashboardStats()
 
-    func load(entries: [ReportEntry]) async {
+    func load() async {
         isLoading = true
         defer { isLoading = false }
 
-        var dmarcOrgs: [String: Int] = [:]
-        var tlsrptOrgs: [String: Int] = [:]
+        let result: DashboardJSON? = await Task.detached(priority: .userInitiated) {
+            try? ReportsCore.shared.dashboard()
+        }.value
 
-        // Per-domain DMARC aggregates
-        var dkimPass: [String: UInt64] = [:]
-        var dkimFail: [String: UInt64] = [:]
-        var spfPass: [String: UInt64] = [:]
-        var spfFail: [String: UInt64] = [:]
-        var dispositions: [String: UInt64] = [:]
-
-        // Per-domain TLS aggregates
-        var tlsSuccess: [String: UInt64] = [:]
-        var tlsFailure: [String: UInt64] = [:]
-        var tlsPolicyTypes: [String: UInt64] = [:]
-        var tlsFailureTypes: [String: UInt64] = [:]
-
-        let core = ReportsCore.shared
-        let decoder = JSONDecoder()
-
-        for (index, entry) in entries.enumerated() {
-            switch entry.type {
-            case .dmarc:
-                dmarcOrgs[entry.org, default: 0] += 1
-                if let json = try? core.show(type: .dmarc, account: entry.account, filename: entry.filename),
-                   let data = json.data(using: .utf8),
-                   let detail = try? decoder.decode(DmarcDetail.self, from: data) {
-                    let domain = detail.policy.domain.isEmpty ? entry.domain : detail.policy.domain
-                    for rec in detail.records {
-                        if rec.dkim_eval == "pass" {
-                            dkimPass[domain, default: 0] += rec.count
-                        } else {
-                            dkimFail[domain, default: 0] += rec.count
-                        }
-                        if rec.spf_eval == "pass" {
-                            spfPass[domain, default: 0] += rec.count
-                        } else {
-                            spfFail[domain, default: 0] += rec.count
-                        }
-                        let disp = rec.disposition.isEmpty ? "none" : rec.disposition
-                        dispositions[disp, default: 0] += rec.count
-                    }
-                }
-            case .tlsrpt:
-                tlsrptOrgs[entry.org, default: 0] += 1
-                if let json = try? core.show(type: .tlsrpt, account: entry.account, filename: entry.filename),
-                   let data = json.data(using: .utf8),
-                   let detail = try? decoder.decode(TlsDetail.self, from: data) {
-                    for policy in detail.policies {
-                        let domain = policy.policy_domain.isEmpty ? entry.domain : policy.policy_domain
-                        let type = policy.policy_type.isEmpty ? "unknown" : policy.policy_type
-                        tlsPolicyTypes[type, default: 0] += policy.total_successful + policy.total_failure
-                        tlsSuccess[domain, default: 0] += policy.total_successful
-                        tlsFailure[domain, default: 0] += policy.total_failure
-                        for f in policy.failures {
-                            let ft = f.result_type.isEmpty ? "unknown" : f.result_type
-                            tlsFailureTypes[ft, default: 0] += f.failed_session_count
-                        }
-                    }
-                }
-            }
-
-            if index % 25 == 0 {
-                await Task.yield()
-            }
-        }
-
-        // Build per-domain structs
-        let dmarcDomains = Set(dkimPass.keys).union(dkimFail.keys).union(spfPass.keys).union(spfFail.keys)
-        let domainAuth = dmarcDomains.map { d in
-            DomainAuthStat(
-                domain: d,
-                dkimPass: dkimPass[d] ?? 0,
-                dkimFail: dkimFail[d] ?? 0,
-                spfPass: spfPass[d] ?? 0,
-                spfFail: spfFail[d] ?? 0
-            )
-        }
-        .sorted { ($0.dkimTotal + $0.spfTotal) > ($1.dkimTotal + $1.spfTotal) }
-
-        let tlsDomains = Set(tlsSuccess.keys).union(tlsFailure.keys)
-        let domainTls = tlsDomains.map { d in
-            DomainTlsStat(
-                domain: d,
-                success: tlsSuccess[d] ?? 0,
-                failure: tlsFailure[d] ?? 0
-            )
-        }
-        .sorted { $0.total > $1.total }
+        guard let dash = result else { return }
 
         var newStats = DashboardStats()
-        newStats.dmarcOrgs = dmarcOrgs.sorted { $0.value > $1.value }.map { OrgCount(org: $0.key, count: $0.value) }
-        newStats.tlsrptOrgs = tlsrptOrgs.sorted { $0.value > $1.value }.map { OrgCount(org: $0.key, count: $0.value) }
-        newStats.domainAuth = domainAuth
-        newStats.dmarcDispositions = dispositions.sorted { $0.value > $1.value }.map { CategoryCount(category: $0.key, count: $0.value) }
-        newStats.domainTls = domainTls
-        newStats.tlsPolicyTypes = tlsPolicyTypes.sorted { $0.value > $1.value }.map { CategoryCount(category: $0.key, count: $0.value) }
-        newStats.tlsFailureTypes = tlsFailureTypes.sorted { $0.value > $1.value }.map { CategoryCount(category: $0.key, count: $0.value) }
+        newStats.dmarcOrgs = dash.dmarc_orgs.sorted { $0.v > $1.v }.map { OrgCount(org: $0.k, count: Int($0.v)) }
+        newStats.tlsrptOrgs = dash.tlsrpt_orgs.sorted { $0.v > $1.v }.map { OrgCount(org: $0.k, count: Int($0.v)) }
+        newStats.dmarcDispositions = dash.dispositions.sorted { $0.v > $1.v }.map { CategoryCount(category: $0.k, count: $0.v) }
+        newStats.tlsPolicyTypes = dash.tls_policy_types.sorted { $0.v > $1.v }.map { CategoryCount(category: $0.k, count: $0.v) }
+        newStats.tlsFailureTypes = dash.tls_failure_types.sorted { $0.v > $1.v }.map { CategoryCount(category: $0.k, count: $0.v) }
+
+        newStats.domainAuth = dash.domain_auth.map {
+            DomainAuthStat(domain: $0.domain, dkimPass: $0.dkim_pass, dkimFail: $0.dkim_fail, spfPass: $0.spf_pass, spfFail: $0.spf_fail, dispNone: $0.disp_none, dispQuarantine: $0.disp_quarantine, dispReject: $0.disp_reject)
+        }.sorted { ($0.dkimTotal + $0.spfTotal) > ($1.dkimTotal + $1.spfTotal) }
+
+        newStats.domainTls = dash.domain_tls.map {
+            DomainTlsStat(
+                domain: $0.domain, success: $0.success, failure: $0.failure,
+                policyTypes: $0.policy_types.map { ($0.k, $0.v) },
+                failureTypes: $0.failure_types.map { ($0.k, $0.v) }
+            )
+        }.sorted { $0.total > $1.total }
+
+        // Summary totals
+        newStats.dmarcReports = dash.dmarc_orgs.reduce(0) { $0 + Int($1.v) }
+        newStats.tlsReports = dash.tlsrpt_orgs.reduce(0) { $0 + Int($1.v) }
+        for stat in newStats.domainAuth {
+            newStats.dmarcTotal += stat.dkimTotal
+            newStats.dmarcPass += stat.dkimPass
+            newStats.dmarcFail += stat.dkimFail
+        }
+        for stat in newStats.domainTls {
+            newStats.tlsTotalSuccess += stat.success
+            newStats.tlsTotalFailure += stat.failure
+        }
+
         stats = newStats
     }
 }
@@ -173,42 +172,47 @@ struct DashboardView: View {
     @StateObject private var loader = DashboardStatsLoader()
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                if loader.isLoading {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Aggregating reports...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+        GeometryReader { geo in
+            let wide = geo.size.width >= 1600
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if loader.isLoading {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Aggregating reports...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    HStack(alignment: .top, spacing: 40) {
+                        dmarcColumn(wide: wide)
+                        mtaStsColumn(wide: wide)
                     }
                 }
-
-                HStack(alignment: .top, spacing: 16) {
-                    dmarcColumn
-                    mtaStsColumn
-                }
+                .padding(24)
             }
-            .padding(24)
         }
         .navigationTitle("Dashboard")
         .background(Color(.windowBackgroundColor))
         .task(id: viewModel.entriesVersion) {
-            await loader.load(entries: viewModel.entries)
+            await loader.load()
         }
     }
 
     // MARK: - DMARC Column
 
-    private var dmarcColumn: some View {
+    private func dmarcColumn(wide: Bool) -> some View {
         VStack(alignment: .leading, spacing: 16) {
-            ColumnHeader(title: "DMARC", color: .orange, icon: "shield.checkered")
+            ColumnHeader(title: "DMARC")
+            Text(loader.stats.dmarcSummary)
+                .foregroundStyle(.secondary)
 
-            SectionBox(title: "Report Sources") {
-                orgChart(data: loader.stats.dmarcOrgs, color: .orange)
+            SectionBox(title: "All Report Sources") {
+                orgChart(data: loader.stats.dmarcOrgs, color: .neonYellow)
             }
 
-            SectionBox(title: "DKIM Authentication by Domain") {
+            let dkim = SectionBox(title: "DKIM Authentication") {
                 domainAuthChart(
                     stats: loader.stats.domainAuth,
                     pass: { $0.dkimPass },
@@ -216,8 +220,7 @@ struct DashboardView: View {
                     ratio: { $0.dkimPassRatio }
                 )
             }
-
-            SectionBox(title: "SPF Authentication by Domain") {
+            let spf = SectionBox(title: "SPF Authentication") {
                 domainAuthChart(
                     stats: loader.stats.domainAuth,
                     pass: { $0.spfPass },
@@ -226,33 +229,54 @@ struct DashboardView: View {
                 )
             }
 
-            SectionBox(title: "Disposition") {
-                categoryBar(data: loader.stats.dmarcDispositions, colorFor: policyColor)
+            if wide {
+                HStack(alignment: .top, spacing: 16) {
+                    dkim.frame(maxWidth: .infinity)
+                    spf.frame(maxWidth: .infinity)
+                }
+            } else {
+                dkim
+                spf
+            }
+
+            SectionBox(title: "DMARC Disposition") {
+                domainDispositionChart(stats: loader.stats.domainAuth)
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
-    // MARK: - MTA-STS Column
+    // MARK: - TLS-RPT Column
 
-    private var mtaStsColumn: some View {
+    private func mtaStsColumn(wide: Bool) -> some View {
         VStack(alignment: .leading, spacing: 16) {
-            ColumnHeader(title: "MTA-STS", color: .teal, icon: "lock.shield")
+            ColumnHeader(title: "TLS-RPT")
+            Text(loader.stats.tlsSummary)
+                .foregroundStyle(.secondary)
 
-            SectionBox(title: "Report Sources") {
-                orgChart(data: loader.stats.tlsrptOrgs, color: .teal)
+            SectionBox(title: "All Report Sources") {
+                orgChart(data: loader.stats.tlsrptOrgs, color: .neonYellow)
             }
 
-            SectionBox(title: "TLS Sessions by Domain") {
+            SectionBox(title: "TLS Sessions") {
                 domainTlsChart(stats: loader.stats.domainTls)
             }
 
-            SectionBox(title: "Policy Type") {
-                categoryBar(data: loader.stats.tlsPolicyTypes, colorFor: policyColor)
+            let policyType = SectionBox(title: "Policy Type") {
+                domainKVChart(stats: loader.stats.domainTls, extract: { $0.policyTypes }, colorFor: policyColor)
+            }
+            let failureType = SectionBox(title: "Failure Type") {
+                domainKVChart(stats: loader.stats.domainTls, extract: { $0.failureTypes }, colorFor: failureColor)
             }
 
-            SectionBox(title: "Failure Type") {
-                categoryBar(data: loader.stats.tlsFailureTypes, colorFor: failureColor)
+            if wide {
+                HStack(alignment: .top, spacing: 16) {
+                    policyType.frame(maxWidth: .infinity)
+                    failureType.frame(maxWidth: .infinity)
+                }
+            } else {
+                policyType
+                failureType
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -338,6 +362,178 @@ struct DashboardView: View {
                         ratio: ratio(stat)
                     )
                 }
+                passFailLegend
+            }
+        }
+    }
+
+    // MARK: - Per-domain Disposition chart
+
+    @ViewBuilder
+    private func domainDispositionChart(stats: [DomainAuthStat]) -> some View {
+        let visible = stats.filter { $0.dispTotal > 0 }.prefix(10)
+        if visible.isEmpty {
+            emptyPlaceholder(height: 80)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(visible)) { stat in
+                    let total = stat.dispTotal
+                    let noneRatio = total > 0 ? Double(stat.dispNone) / Double(total) * 100 : 0
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack {
+                            Text(stat.domain)
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                            Spacer()
+                            if stat.dispReject > 0 {
+                                let rejectPct = Double(stat.dispReject) / Double(total) * 100
+                                Text("\(String(format: "%.0f", rejectPct))%")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(Color.failRed)
+                            } else if stat.dispQuarantine > 0 {
+                                let quarantinePct = Double(stat.dispQuarantine) / Double(total) * 100
+                                Text("\(String(format: "%.0f", quarantinePct))%")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.orange)
+                            } else {
+                                Text("\(String(format: "%.0f", noneRatio))%")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.gray)
+                            }
+                        }
+
+                        Chart {
+                            BarMark(x: .value("Count", stat.dispNone))
+                                .foregroundStyle(Color.gray)
+                                .annotation(position: .overlay) {
+                                    if stat.dispNone > 0 {
+                                        Text("\(stat.dispNone)")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundStyle(Color.barText)
+                                    }
+                                }
+                            BarMark(x: .value("Count", stat.dispQuarantine))
+                                .foregroundStyle(Color.orange)
+                                .annotation(position: .overlay) {
+                                    if stat.dispQuarantine > 0 {
+                                        Text("\(stat.dispQuarantine)")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundStyle(Color.barText)
+                                    }
+                                }
+                            BarMark(x: .value("Count", stat.dispReject))
+                                .foregroundStyle(Color.failRed)
+                                .annotation(position: .overlay) {
+                                    if stat.dispReject > 0 {
+                                        Text("\(stat.dispReject)")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundStyle(Color.barText)
+                                    }
+                                }
+                        }
+                        .chartXAxis(.hidden)
+                        .chartYAxis(.hidden)
+                        .chartPlotStyle { plot in
+                            plot.clipShape(RoundedRectangle(cornerRadius: 3))
+                        }
+                        .frame(height: 18)
+                    }
+                }
+
+                // Legend (bottom-right)
+                HStack {
+                    Spacer()
+                    HStack(spacing: 12) {
+                        HStack(spacing: 3) {
+                            Circle().fill(Color.gray).frame(width: 6, height: 6)
+                            Text("none").font(.caption2.monospaced()).foregroundStyle(.gray)
+                        }
+                        HStack(spacing: 3) {
+                            Circle().fill(Color.orange).frame(width: 6, height: 6)
+                            Text("quarantine").font(.caption2.monospaced()).foregroundStyle(.orange)
+                        }
+                        HStack(spacing: 3) {
+                            Circle().fill(Color.failRed).frame(width: 6, height: 6)
+                            Text("reject").font(.caption2.monospaced()).foregroundStyle(Color.failRed)
+                        }
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    // MARK: - Per-domain KV chart (policy type / failure type)
+
+    @ViewBuilder
+    private func domainKVChart(
+        stats: [DomainTlsStat],
+        extract: @escaping (DomainTlsStat) -> [(name: String, count: UInt64)],
+        colorFor: @escaping (String) -> Color
+    ) -> some View {
+        let visible = stats.filter { !extract($0).isEmpty }.prefix(10)
+        if visible.isEmpty {
+            emptyPlaceholder(height: 80)
+        } else {
+            let allNames = Array(visible).reduce(into: [String]()) { result, stat in
+                for item in extract(stat) where !result.contains(item.name) {
+                    result.append(item.name)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(visible)) { stat in
+                    let items = extract(stat)
+                    let total = items.reduce(UInt64(0)) { $0 + $1.count }
+                    let topItem = items.max(by: { $0.count < $1.count })
+                    let topPct = total > 0 && topItem != nil ? Double(topItem!.count) / Double(total) * 100 : 0
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack {
+                            Text(stat.domain)
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                            Spacer()
+                            if let topItem {
+                                Text("\(String(format: "%.0f", topPct))%")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(colorFor(topItem.name))
+                            }
+                        }
+
+                        Chart(items, id: \.name) { item in
+                            BarMark(x: .value("Count", item.count))
+                                .foregroundStyle(colorFor(item.name))
+                                .annotation(position: .overlay) {
+                                    if item.count > 0 {
+                                        Text("\(item.count)")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundStyle(Color.barText)
+                                    }
+                                }
+                        }
+                        .chartXAxis(.hidden)
+                        .chartYAxis(.hidden)
+                        .chartPlotStyle { plot in
+                            plot.clipShape(RoundedRectangle(cornerRadius: 3))
+                        }
+                        .frame(height: 18)
+                    }
+                }
+
+                // Legend (bottom-right)
+                HStack {
+                    Spacer()
+                    HStack(spacing: 12) {
+                        ForEach(allNames, id: \.self) { name in
+                            HStack(spacing: 3) {
+                                Circle().fill(colorFor(name)).frame(width: 6, height: 6)
+                                Text(name).font(.caption2.monospaced()).foregroundStyle(colorFor(name))
+                            }
+                        }
+                    }
+                }
+                .padding(.top, 2)
             }
         }
     }
@@ -359,8 +555,26 @@ struct DashboardView: View {
                         ratio: stat.successRatio
                     )
                 }
+                passFailLegend
             }
         }
+    }
+
+    private var passFailLegend: some View {
+        HStack {
+            Spacer()
+            HStack(spacing: 12) {
+                HStack(spacing: 3) {
+                    Circle().fill(Color.passGreen).frame(width: 6, height: 6)
+                    Text("pass").font(.caption2.monospaced()).foregroundStyle(Color.passGreen)
+                }
+                HStack(spacing: 3) {
+                    Circle().fill(Color.failRed).frame(width: 6, height: 6)
+                    Text("fail").font(.caption2.monospaced()).foregroundStyle(Color.failRed)
+                }
+            }
+        }
+        .padding(.top, 2)
     }
 
     // MARK: - Shared per-domain stacked bar
@@ -381,21 +595,21 @@ struct DashboardView: View {
 
             Chart {
                 BarMark(x: .value("Count", pass))
-                    .foregroundStyle(.green)
+                    .foregroundStyle(Color.passGreen)
                     .annotation(position: .overlay) {
                         if pass > 0 {
                             Text("\(pass)")
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(.white)
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(Color.barText)
                         }
                     }
                 BarMark(x: .value("Count", fail))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Color.failRed)
                     .annotation(position: .overlay) {
                         if fail > 0 {
                             Text("\(fail)")
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(.white)
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(Color.barText)
                         }
                     }
             }
@@ -409,9 +623,9 @@ struct DashboardView: View {
     }
 
     private func ratioColor(_ ratio: Double) -> Color {
-        if ratio >= 0.95 { return .green }
+        if ratio >= 0.95 { return .passGreen }
         if ratio >= 0.8 { return .orange }
-        return .red
+        return .failRed
     }
 
     // MARK: - Category bar (aggregate distribution)
@@ -466,17 +680,11 @@ struct DashboardView: View {
 
 struct ColumnHeader: View {
     let title: String
-    let color: Color
-    let icon: String
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-                .foregroundStyle(color)
-            Text(title)
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(color)
-        }
+        Text(title)
+            .font(.title2.weight(.semibold))
+            .foregroundStyle(.primary)
     }
 }
 
@@ -504,8 +712,8 @@ struct SectionBox<Content: View>: View {
 
 private func failureColor(_ type: String) -> Color {
     let lower = type.lowercased()
-    if lower.contains("success") { return .green }
-    if lower.contains("starttls") || lower.contains("expired") || lower.contains("invalid") { return .red }
+    if lower.contains("success") { return .passGreen }
+    if lower.contains("starttls") || lower.contains("expired") || lower.contains("invalid") { return .failRed }
     if lower.contains("mismatch") || lower.contains("untrusted") { return .orange }
     if lower.contains("dnssec") || lower.contains("sts") { return .purple }
     return .gray

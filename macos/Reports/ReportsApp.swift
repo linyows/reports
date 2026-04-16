@@ -12,7 +12,14 @@ struct ReportsApp: App {
         .defaultSize(width: 1000, height: 700)
         .commands {
             CommandGroup(after: .newItem) {
-                Button("Fetch Reports") {
+                Button("Add Account...") {
+                    viewModel.showAddAccount = true
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("Sync Reports") {
                     Task { await viewModel.fetchReports() }
                 }
                 .keyboardShortcut("r", modifiers: [.command])

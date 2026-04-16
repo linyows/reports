@@ -1,12 +1,40 @@
 import Foundation
 import SwiftUI
 
+// MARK: - Semantic Colors (neon palette matching logo rgb(194,255,38))
+
+extension Color {
+    /// Neon yellow for pass/success — matches logo rgb(194,255,38).
+    static let passGreen = Color(light: .init(red: 0.50, green: 0.66, blue: 0.10),
+                                 dark: .init(red: 0.76, green: 1.00, blue: 0.15))
+    /// Neon pink for fail — electric magenta-pink.
+    static let failRed = Color(red: 1.00, green: 0.20, blue: 0.60)
+    /// Problem badge — neon pink-red, slightly muted for badge use.
+    static let problemRed = Color(light: .init(red: 0.70, green: 0.10, blue: 0.15),
+                                  dark: .init(red: 0.95, green: 0.30, blue: 0.35))
+    /// Neon yellow matching the logo rgb(194,255,38) — for donut charts and accents.
+    static let neonYellow = Color(light: .init(red: 0.50, green: 0.66, blue: 0.10),
+                                  dark: .init(red: 0.76, green: 1.00, blue: 0.15))
+    /// Bar chart overlay text — white on light (dark bars), black on dark (bright neon bars).
+    static let barText = Color(light: .white, dark: .black)
+}
+
+private extension Color {
+    init(light: Color, dark: Color) {
+        self.init(nsColor: NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? NSColor(dark)
+                : NSColor(light)
+        })
+    }
+}
+
 // MARK: - Policy color (green -> cyan -> blue -> magenta -> gray)
 
 func policyColor(_ policy: String) -> Color {
     switch policy.lowercased() {
     case "reject", "sts":
-        return .green
+        return .passGreen
     case "tlsa":
         return .cyan
     case "quarantine":
@@ -70,6 +98,7 @@ struct ReportEntry: Codable, Identifiable, Hashable {
     let domain: String
     let policy: String
     let filename: String
+    let problems: Int
 
     var id: String { "\(account)-\(type.rawValue)-\(reportId)" }
 
@@ -80,7 +109,7 @@ struct ReportEntry: Codable, Identifiable, Hashable {
     enum CodingKeys: String, CodingKey {
         case account, type, org
         case reportId = "id"
-        case date, domain, policy, filename
+        case date, domain, policy, filename, problems
     }
 }
 
@@ -248,6 +277,88 @@ struct IpEnrichment: Codable {
         let upper = country.uppercased()
         let scalars = upper.prefix(2).unicodeScalars.compactMap { scalar -> Unicode.Scalar? in
             let offset = scalar.value - 0x41 // 'A'
+            guard offset < 26 else { return nil }
+            return Unicode.Scalar(base + offset)
+        }
+        guard scalars.count == 2 else { return "-" }
+        return String(scalars.map { Character($0) })
+    }
+}
+
+// MARK: - Dashboard Stats (from reports_dashboard API)
+
+struct KV: Codable {
+    let k: String
+    let v: UInt64
+}
+
+struct DashDomainAuth: Codable {
+    let domain: String
+    let dkim_pass: UInt64
+    let dkim_fail: UInt64
+    let spf_pass: UInt64
+    let spf_fail: UInt64
+    let disp_none: UInt64
+    let disp_quarantine: UInt64
+    let disp_reject: UInt64
+}
+
+struct DashDomainTls: Codable {
+    let domain: String
+    let success: UInt64
+    let failure: UInt64
+    let policy_types: [KV]
+    let failure_types: [KV]
+}
+
+struct DashboardJSON: Codable {
+    let dmarc_orgs: [KV]
+    let tlsrpt_orgs: [KV]
+    let dispositions: [KV]
+    let tls_policy_types: [KV]
+    let tls_failure_types: [KV]
+    let domain_auth: [DashDomainAuth]
+    let domain_tls: [DashDomainTls]
+}
+
+// MARK: - Mail Source (from reports_sources API)
+
+struct MailSource: Codable, Identifiable {
+    let ip: String
+    let messages: UInt64
+    let dmarc_issues: UInt64
+    let tls_failures: UInt64
+    let types: [String]
+    let domains: [String]
+    let ptr: String
+    let asn: String
+    let asn_org: String
+    let country: String
+
+    var id: String { ip }
+    var totalIssues: UInt64 { dmarc_issues + tls_failures }
+    var hasIssues: Bool { totalIssues > 0 }
+
+    var hasDmarc: Bool { types.contains("dmarc") }
+    var hasTlsrpt: Bool { types.contains("tlsrpt") }
+
+    var ptrDisplay: String {
+        if ptr.isEmpty || ptr == ip { return "-" }
+        return ptr
+    }
+
+    var asnDisplay: String {
+        if asn.isEmpty { return "-" }
+        if asn_org.isEmpty { return "AS\(asn)" }
+        return "AS\(asn) \(asn_org)"
+    }
+
+    var countryFlag: String {
+        guard country.count >= 2 else { return "-" }
+        let base: UInt32 = 0x1F1E6
+        let upper = country.uppercased()
+        let scalars = upper.prefix(2).unicodeScalars.compactMap { scalar -> Unicode.Scalar? in
+            let offset = scalar.value - 0x41
             guard offset < 26 else { return nil }
             return Unicode.Scalar(base + offset)
         }

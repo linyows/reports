@@ -18,12 +18,19 @@ final class ReportsViewModel: ObservableObject {
     @Published var filterAccount: String?
     @Published var filterDomain: String?
     @Published var searchText = ""
+    @Published var filterProblems = false
     @Published var showDashboard = true
+    @Published var showMailSources = false
     @Published var enrichments: [String: IpEnrichment] = [:]
+    @Published var hasAccounts = true
+    @Published var showAddAccount = false
+    @Published var mailSources: [MailSource] = []
+    @Published var isLoadingSources = false
 
     private let core = ReportsCore.shared
     private var enrichmentTask: Task<Void, Never>?
     private var detailTask: Task<Void, Never>?
+    private var sourcesTask: Task<Void, Never>?
 
     var selectedEntry: ReportEntry? {
         guard let id = selectedEntryID else { return nil }
@@ -32,6 +39,9 @@ final class ReportsViewModel: ObservableObject {
 
     var filteredEntries: [ReportEntry] {
         var result = entries
+        if filterProblems {
+            result = result.filter { $0.problems > 0 }
+        }
         if let filterType {
             result = result.filter { $0.type == filterType }
         }
@@ -54,6 +64,7 @@ final class ReportsViewModel: ObservableObject {
 
     var dmarcCount: Int { entries.filter { $0.type == .dmarc }.count }
     var tlsrptCount: Int { entries.filter { $0.type == .tlsrpt }.count }
+    var problemsCount: Int { entries.filter { $0.problems > 0 }.count }
 
     var accounts: [(name: String, count: Int)] {
         var counts: [String: Int] = [:]
@@ -71,7 +82,9 @@ final class ReportsViewModel: ObservableObject {
         filterType = nil
         filterAccount = nil
         filterDomain = nil
+        filterProblems = false
         showDashboard = false
+        showMailSources = false
     }
 
     func selectDashboard() {
@@ -79,26 +92,78 @@ final class ReportsViewModel: ObservableObject {
         filterType = nil
         filterAccount = nil
         filterDomain = nil
+        filterProblems = false
         showDashboard = true
+        showMailSources = false
+    }
+
+    func selectMailSources() {
+        closeDetail()
+        filterType = nil
+        filterAccount = nil
+        filterDomain = nil
+        filterProblems = false
+        showDashboard = false
+        showMailSources = true
     }
 
     func loadReports() {
         isLoading = true
         errorMessage = nil
+
+        // Check if config has accounts
+        let configPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/reports/config.json").path
+        if !FileManager.default.fileExists(atPath: configPath) {
+            hasAccounts = false
+            isLoading = false
+            return
+        }
+        if let data = FileManager.default.contents(atPath: configPath),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let accounts = json["accounts"] as? [[String: Any]],
+           !accounts.isEmpty {
+            hasAccounts = true
+        } else {
+            hasAccounts = false
+            isLoading = false
+            return
+        }
+
         do {
             entries = try core.list()
             entriesVersion &+= 1
+            loadSourcesInBackground()
         } catch {
             errorMessage = error.localizedDescription
         }
         isLoading = false
     }
 
+    private func loadSourcesInBackground() {
+        sourcesTask?.cancel()
+        isLoadingSources = true
+        sourcesTask = Task { [weak self, core] in
+            let result: [MailSource] = await Task.detached(priority: .utility) {
+                (try? core.sources()) ?? []
+            }.value
+            if Task.isCancelled { return }
+            let sorted = result.sorted {
+                if $0.messages != $1.messages { return $0.messages > $1.messages }
+                return $0.totalIssues > $1.totalIssues
+            }
+            await MainActor.run {
+                self?.mailSources = sorted
+                self?.isLoadingSources = false
+            }
+        }
+    }
+
     func fetchReports() async {
         isFetching = true
         errorMessage = nil
         do {
-            try await core.fetch()
+            try await core.sync()
             loadReports()
         } catch {
             errorMessage = error.localizedDescription

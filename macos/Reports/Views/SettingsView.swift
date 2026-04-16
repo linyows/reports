@@ -230,7 +230,7 @@ struct AdvancedSettingsTab: View {
                 LabeledContent("Status") {
                     HStack(spacing: 4) {
                         Circle()
-                            .fill(configExists ? .green : .red)
+                            .fill(configExists ? Color.passGreen : Color.failRed)
                             .frame(width: 8, height: 8)
                         Text(configExists ? "Found" : "Not found")
                             .foregroundStyle(.secondary)

@@ -157,14 +157,14 @@ struct ReportDetailView: View {
                     TableColumn("DKIM") { row in
                         Text(row.record.dkim_eval)
                             .monospaced()
-                            .foregroundStyle(row.record.dkim_eval == "pass" ? .green : .red)
+                            .foregroundStyle(row.record.dkim_eval == "pass" ? Color.passGreen : Color.failRed)
                     }
                     .width(min: 40, ideal: 50)
 
                     TableColumn("SPF") { row in
                         Text(row.record.spf_eval)
                             .monospaced()
-                            .foregroundStyle(row.record.spf_eval == "pass" ? .green : .red)
+                            .foregroundStyle(row.record.spf_eval == "pass" ? Color.passGreen : Color.failRed)
                     }
                     .width(min: 40, ideal: 50)
                 }
@@ -214,7 +214,7 @@ struct ReportDetailView: View {
                                 Text("\(policy.total_successful)")
                                     .font(.system(.body, design: .monospaced))
                                     .fontWeight(.semibold)
-                                    .foregroundStyle(.green)
+                                    .foregroundStyle(Color.passGreen)
                             }
                             GridRow {
                                 Text("Failed:")
@@ -223,7 +223,7 @@ struct ReportDetailView: View {
                                 Text("\(policy.total_failure)")
                                     .font(.system(.body, design: .monospaced))
                                     .fontWeight(.semibold)
-                                    .foregroundStyle(policy.total_failure > 0 ? .red : .secondary)
+                                    .foregroundStyle(policy.total_failure > 0 ? Color.failRed : Color.secondary)
                             }
                             GridRow {
                                 Text("Total:")
@@ -243,10 +243,10 @@ struct ReportDetailView: View {
                                 GeometryReader { geo in
                                     ZStack(alignment: .leading) {
                                         RoundedRectangle(cornerRadius: 4)
-                                            .fill(Color.red.opacity(0.2))
+                                            .fill(Color.failRed.opacity(0.2))
                                             .frame(height: 8)
                                         RoundedRectangle(cornerRadius: 4)
-                                            .fill(Color.green)
+                                            .fill(Color.passGreen)
                                             .frame(width: geo.size.width * ratio, height: 8)
                                     }
                                 }
@@ -292,7 +292,7 @@ struct ReportDetailView: View {
                             TableColumn("SESSIONS") { f in
                                 Text("\(f.failed_session_count)")
                                     .monospaced()
-                                    .foregroundStyle(.red)
+                                    .foregroundStyle(Color.failRed)
                             }
                             .width(min: 50, ideal: 70)
                         }
