@@ -917,50 +917,18 @@ export fn reports_show(config_json: [*:0]const u8, report_type: [*:0]const u8, a
     return result.ptr;
 }
 
-const DmarcProblemsJson = struct {
-    records: []const struct {
-        count: u64 = 0,
-        dkim_eval: []const u8 = "",
-        spf_eval: []const u8 = "",
-    } = &.{},
-};
-
-const TlsProblemsJson = struct {
-    policies: []const struct {
-        total_failure: u64 = 0,
-    } = &.{},
-};
-
 fn countProblems(alloc: std.mem.Allocator, data_dir: []const u8, entry: reports.store.ReportEntry) u64 {
     const st = reports.store.Store.init(alloc, data_dir, entry.account_name);
     switch (entry.report_type) {
         .dmarc => {
             const data = st.loadDmarcReport(entry.filename) catch return 0;
             defer alloc.free(data);
-            const parsed = std.json.parseFromSlice(DmarcProblemsJson, alloc, data, .{
-                .ignore_unknown_fields = true,
-            }) catch return 0;
-            defer parsed.deinit();
-            var count: u64 = 0;
-            for (parsed.value.records) |rec| {
-                const dkim_pass = std.mem.eql(u8, rec.dkim_eval, "pass");
-                const spf_pass = std.mem.eql(u8, rec.spf_eval, "pass");
-                if (!dkim_pass and !spf_pass) count += rec.count;
-            }
-            return count;
+            return reports.stats.countDmarcProblems(alloc, data);
         },
         .tlsrpt => {
             const data = st.loadTlsReport(entry.filename) catch return 0;
             defer alloc.free(data);
-            const parsed = std.json.parseFromSlice(TlsProblemsJson, alloc, data, .{
-                .ignore_unknown_fields = true,
-            }) catch return 0;
-            defer parsed.deinit();
-            var count: u64 = 0;
-            for (parsed.value.policies) |pol| {
-                count += pol.total_failure;
-            }
-            return count;
+            return reports.stats.countTlsProblems(alloc, data);
         },
     }
 }

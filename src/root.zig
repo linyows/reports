@@ -8,3 +8,4 @@ pub const enrichcache = @import("enrichcache.zig");
 pub const store = @import("store.zig");
 pub const config = @import("config.zig");
 pub const fetch = @import("fetch.zig");
+pub const stats = @import("stats.zig");
