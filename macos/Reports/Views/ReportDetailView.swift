@@ -12,44 +12,76 @@ struct ReportDetailView: View {
     @EnvironmentObject var viewModel: ReportsViewModel
 
     var body: some View {
-        Group {
-            if let entry = viewModel.selectedEntry, let json = viewModel.detailJSON {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        switch entry.type {
-                        case .dmarc:
-                            dmarcDetail(json: json)
-                        case .tlsrpt:
-                            tlsrptDetail(json: json)
-                        }
+        if let entry = viewModel.selectedEntry {
+            VStack(spacing: 0) {
+                detailHeader(entry: entry, json: viewModel.detailJSON)
+                Divider()
+                if viewModel.isLoadingDetail || viewModel.detailJSON == nil {
+                    VStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.regular)
+                        Text("Loading report...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    .padding()
-                    .textSelection(.enabled)
-                }
-            } else {
-                ContentUnavailableView {
-                    Label("Select a Report", systemImage: "doc.text")
-                } description: {
-                    Text("Choose a report from the list to view details")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let json = viewModel.detailJSON {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            switch entry.type {
+                            case .dmarc:
+                                dmarcDetail(json: json)
+                            case .tlsrpt:
+                                tlsrptDetail(json: json)
+                            }
+                        }
+                        .padding()
+                        .textSelection(.enabled)
+                    }
                 }
             }
         }
-        .navigationTitle(viewModel.selectedEntry?.displayTitle ?? "Detail")
-        .toolbar {
-            if viewModel.selectedEntry != nil, viewModel.detailJSON != nil {
-                ToolbarItem {
-                    Button {
-                        if let json = viewModel.detailJSON {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(json, forType: .string)
-                        }
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                    }
-                    .help("Copy raw JSON")
-                }
+    }
+
+    @ViewBuilder
+    private func detailHeader(entry: ReportEntry, json: String?) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: entry.type == .dmarc ? "shield.checkered" : "lock.shield")
+                .foregroundStyle(.secondary)
+            Text(entry.displayTitle)
+                .font(.headline)
+                .lineLimit(1)
+
+            // Subtle indicator that background enrichment is still running
+            if !viewModel.enrichments.isEmpty || viewModel.isLoadingDetail {
+                EmptyView() // placeholder; spinner handled in main body
             }
+
+            Spacer()
+
+            if let json {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(json, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .help("Copy raw JSON")
+            }
+
+            Button {
+                viewModel.closeDetail()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Close detail")
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.background.secondary)
     }
 
     // MARK: - DMARC show (matches CLI: showDmarcTable)
@@ -77,7 +109,7 @@ struct ReportDetailView: View {
                 let enrichedRows = report.records.map { rec in
                     EnrichedDmarcRecord(
                         record: rec,
-                        enrichment: ReportsCore.shared.enrichIP(rec.source_ip)
+                        enrichment: viewModel.enrichments[rec.source_ip]
                     )
                 }
                 Table(enrichedRows) {
@@ -238,7 +270,7 @@ struct ReportDetailView: View {
                             .width(min: 80, ideal: 130)
 
                             TableColumn("PTR") { f in
-                                let info = ReportsCore.shared.enrichIP(f.sending_mta_ip)
+                                let info = viewModel.enrichments[f.sending_mta_ip]
                                 Text(info?.ptrDisplay(sourceIP: f.sending_mta_ip) ?? "-")
                                     .monospaced().lineLimit(1)
                                     .foregroundStyle(info?.ptr.isEmpty ?? true ? .secondary : .primary)
@@ -246,7 +278,7 @@ struct ReportDetailView: View {
                             .width(min: 80, ideal: 160)
 
                             TableColumn("ASN") { f in
-                                let info = ReportsCore.shared.enrichIP(f.sending_mta_ip)
+                                let info = viewModel.enrichments[f.sending_mta_ip]
                                 Text(info?.asnDisplay ?? "-")
                                     .monospaced().lineLimit(1)
                             }

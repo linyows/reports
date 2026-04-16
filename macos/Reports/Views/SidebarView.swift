@@ -11,11 +11,21 @@ struct SidebarView: View {
         List {
             Section {
                 SidebarButton(
-                    title: "All",
-                    showDot: true,
+                    title: "Dashboard",
+                    icon: "square.grid.2x2",
                     count: viewModel.entries.count,
-                    color: .secondary,
-                    isSelected: isTypeFilter && viewModel.filterType == nil,
+                    color: .primary,
+                    isSelected: viewModel.showDashboard
+                ) {
+                    viewModel.selectDashboard()
+                }
+
+                SidebarButton(
+                    title: "All",
+                    icon: "tray.full",
+                    count: viewModel.entries.count,
+                    color: .primary,
+                    isSelected: !viewModel.showDashboard && isTypeFilter && viewModel.filterType == nil,
                     isLoading: viewModel.isLoading
                 ) {
                     viewModel.clearFilters()
@@ -23,10 +33,10 @@ struct SidebarView: View {
 
                 SidebarButton(
                     title: "DMARC",
-                    showDot: true,
+                    icon: "shield.checkered",
                     count: viewModel.dmarcCount,
-                    color: .orange,
-                    isSelected: isTypeFilter && viewModel.filterType == .dmarc,
+                    color: .primary,
+                    isSelected: !viewModel.showDashboard && isTypeFilter && viewModel.filterType == .dmarc,
                     isLoading: viewModel.isLoading
                 ) {
                     viewModel.clearFilters()
@@ -35,17 +45,15 @@ struct SidebarView: View {
 
                 SidebarButton(
                     title: "TLS-RPT",
-                    showDot: true,
+                    icon: "lock.shield",
                     count: viewModel.tlsrptCount,
-                    color: Color(.systemTeal),
-                    isSelected: isTypeFilter && viewModel.filterType == .tlsrpt,
+                    color: .primary,
+                    isSelected: !viewModel.showDashboard && isTypeFilter && viewModel.filterType == .tlsrpt,
                     isLoading: viewModel.isLoading
                 ) {
                     viewModel.clearFilters()
                     viewModel.filterType = .tlsrpt
                 }
-            } header: {
-                SectionHeader(title: "Type", icon: "doc.text")
             }
 
             Section {
@@ -55,7 +63,7 @@ struct SidebarView: View {
                         showDot: true,
                         count: account.count,
                         color: labelColor(for: account.name),
-                        isSelected: viewModel.filterAccount == account.name
+                        isSelected: !viewModel.showDashboard && viewModel.filterAccount == account.name
                     ) {
                         viewModel.clearFilters()
                         viewModel.filterAccount = account.name
@@ -72,7 +80,7 @@ struct SidebarView: View {
                         showDot: true,
                         count: domain.count,
                         color: labelColor(for: domain.name),
-                        isSelected: viewModel.filterDomain == domain.name
+                        isSelected: !viewModel.showDashboard && viewModel.filterDomain == domain.name
                     ) {
                         viewModel.clearFilters()
                         viewModel.filterDomain = domain.name
@@ -83,6 +91,7 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
         .safeAreaInset(edge: .bottom) {
             HStack {
                 SettingsLink {

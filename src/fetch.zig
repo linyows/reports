@@ -200,6 +200,118 @@ pub fn processResults(
     return .{ .dmarc = dmarc_count, .tls = tls_count };
 }
 
+/// Scan all stored reports across accounts and collect unique source IPs.
+/// Caller owns the returned slice and each inner string.
+pub fn collectSourceIps(
+    allocator: Allocator,
+    data_dir: []const u8,
+    account_names: []const []const u8,
+) ![]const []const u8 {
+    var set = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = set.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        set.deinit();
+    }
+
+    for (account_names) |name| {
+        try collectFromAccount(allocator, data_dir, name, "dmarc", &set);
+        try collectFromAccount(allocator, data_dir, name, "tlsrpt", &set);
+    }
+
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(allocator);
+    var it = set.iterator();
+    while (it.next()) |kv| {
+        const copy = try allocator.dupe(u8, kv.key_ptr.*);
+        try list.append(allocator, copy);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn collectFromAccount(
+    allocator: Allocator,
+    data_dir: []const u8,
+    account_name: []const u8,
+    subdir: []const u8,
+    set: *std.StringHashMap(void),
+) !void {
+    const dir_path = try std.fs.path.join(allocator, &.{ data_dir, account_name, subdir });
+    defer allocator.free(dir_path);
+
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+
+        const data = blk: {
+            const file = dir.openFile(entry.name, .{}) catch continue;
+            defer file.close();
+            break :blk file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch continue;
+        };
+        defer allocator.free(data);
+
+        extractIpsFromJson(allocator, data, subdir, set) catch continue;
+    }
+}
+
+fn extractIpsFromJson(
+    allocator: Allocator,
+    data: []const u8,
+    subdir: []const u8,
+    set: *std.StringHashMap(void),
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return;
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return;
+
+    if (std.mem.eql(u8, subdir, "dmarc")) {
+        const records = root.object.get("records") orelse return;
+        if (records != .array) return;
+        for (records.array.items) |rec| {
+            if (rec != .object) continue;
+            const ip_val = rec.object.get("source_ip") orelse continue;
+            if (ip_val != .string) continue;
+            const ip = ip_val.string;
+            if (ip.len == 0) continue;
+            if (set.contains(ip)) continue;
+            const key = try allocator.dupe(u8, ip);
+            set.put(key, {}) catch {
+                allocator.free(key);
+            };
+        }
+    } else if (std.mem.eql(u8, subdir, "tlsrpt")) {
+        const policies = root.object.get("policies") orelse return;
+        if (policies != .array) return;
+        for (policies.array.items) |p| {
+            if (p != .object) continue;
+            const failures = p.object.get("failures") orelse continue;
+            if (failures != .array) continue;
+            for (failures.array.items) |f| {
+                if (f != .object) continue;
+                const ip_val = f.object.get("sending_mta_ip") orelse continue;
+                if (ip_val != .string) continue;
+                const ip = ip_val.string;
+                if (ip.len == 0) continue;
+                if (set.contains(ip)) continue;
+                const key = try allocator.dupe(u8, ip);
+                set.put(key, {}) catch {
+                    allocator.free(key);
+                };
+            }
+        }
+    }
+}
+
+pub fn freeIpList(allocator: Allocator, ips: []const []const u8) void {
+    for (ips) |ip| allocator.free(ip);
+    allocator.free(ips);
+}
+
 pub fn freeResults(allocator: Allocator, results: []FetchResult) void {
     for (results) |r| {
         if (r.data) |d| allocator.free(d);
