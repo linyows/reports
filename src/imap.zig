@@ -5,6 +5,13 @@ const c = @cImport({
     @cInclude("curl/curl.h");
 });
 
+/// Last curl error message (static string from curl_easy_strerror, no need to free).
+var g_last_curl_error: ?[]const u8 = null;
+
+pub fn lastCurlError() ?[]const u8 {
+    return g_last_curl_error;
+}
+
 pub const Client = struct {
     allocator: Allocator,
     host: []const u8,
@@ -129,7 +136,9 @@ pub const Client = struct {
         if (result != c.CURLE_OK) {
             const err_msg = c.curl_easy_strerror(result);
             if (err_msg) |msg| {
-                std.debug.print("curl error: {s}\n", .{std.mem.span(msg)});
+                const span = std.mem.span(msg);
+                std.debug.print("curl error: {s}\n", .{span});
+                g_last_curl_error = span;
             }
             if (response.data) |d| self.allocator.free(d);
             return error.CurlPerformFailed;
