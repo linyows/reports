@@ -385,17 +385,18 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
             tls_rpt_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
         }
 
-        const dmarc_policy_weak = if (dmarc_txt) |t| std.mem.indexOf(u8, t, "p=none") != null else false;
-        const spf_weak = if (spf_txt) |t| std.mem.indexOf(u8, t, "~all") != null else false;
+        const dmarc_policy_weak = if (dmarc_txt) |t| reports.stats.isDmarcPolicyWeak(t) else false;
+        const spf_weak = if (spf_txt) |t| reports.stats.isSpfWeak(t) else false;
         const has_dmarc = dmarc_txt != null;
         const has_spf = spf_txt != null;
         const has_dkim = dkim_txt != null;
+        const dns_status = reports.stats.evaluateDnsStatus(has_dmarc, has_spf, has_dkim, dmarc_policy_weak, spf_weak);
 
         if (is_json) {
             if (!json_first) json_buf.appendSlice(allocator, ",") catch continue;
             json_first = false;
 
-            const status_str: []const u8 = if (!has_dmarc or !has_spf or !has_dkim) "critical" else if (dmarc_policy_weak or spf_weak) "warning" else "ok";
+            const status_str = dns_status.label();
             const dmarc_s = if (dmarc_txt) |t| t else "";
             const spf_s = if (spf_txt) |t| t else "";
             const dkim_s = if (dkim_txt) |t| t else "";
@@ -408,12 +409,11 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
             defer allocator.free(line);
             json_buf.appendSlice(allocator, line) catch continue;
         } else {
-            const icon = if (!has_dmarc or !has_spf or !has_dkim)
-                icon_red
-            else if (dmarc_policy_weak or spf_weak)
-                icon_yellow
-            else
-                icon_green;
+            const icon = switch (dns_status) {
+                .ok => icon_green,
+                .warning => icon_yellow,
+                .critical => icon_red,
+            };
 
             // Print domain header
             const hdr = std.fmt.bufPrint(&buf, " {s} {s}\n", .{ icon, domain }) catch "";
@@ -913,27 +913,27 @@ fn cmdCheck(
                     result.dmarc_total += rec.count;
                     const dkim_pass = std.mem.eql(u8, rec.dkim_eval, "pass");
                     const spf_pass = std.mem.eql(u8, rec.spf_eval, "pass");
-                    if (dkim_pass and spf_pass) {
-                        result.dmarc_pass += rec.count;
-                    } else if (dkim_pass and !spf_pass) {
-                        result.dmarc_pass += rec.count; // DKIM pass is enough
-                        result.spf_only_fail += rec.count;
-                    } else if (!dkim_pass and spf_pass) {
-                        result.dmarc_pass += rec.count; // SPF pass is enough
-                        result.dkim_only_fail += rec.count;
+                    if (reports.stats.classifyFailure(dkim_pass, spf_pass)) |ft| {
+                        switch (ft) {
+                            .both_fail => result.both_fail += rec.count,
+                            .dkim_only_fail => result.dkim_only_fail += rec.count,
+                            .spf_only_fail => result.spf_only_fail += rec.count,
+                        }
+                        if (ft == .both_fail) {
+                            result.dmarc_fail += rec.count;
+                            dmarc_fails.append(allocator, .{
+                                .account = entry.account_name,
+                                .domain = entry.domain,
+                                .org = entry.org_name,
+                                .source_ip = allocator.dupe(u8, rec.source_ip) catch continue,
+                                .count = rec.count,
+                                .dkim = allocator.dupe(u8, rec.dkim_eval) catch continue,
+                                .spf = allocator.dupe(u8, rec.spf_eval) catch continue,
+                                .header_from = allocator.dupe(u8, rec.header_from) catch continue,
+                            }) catch {};
+                        }
                     } else {
-                        result.both_fail += rec.count;
-                        result.dmarc_fail += rec.count;
-                        dmarc_fails.append(allocator, .{
-                            .account = entry.account_name,
-                            .domain = entry.domain,
-                            .org = entry.org_name,
-                            .source_ip = allocator.dupe(u8, rec.source_ip) catch continue,
-                            .count = rec.count,
-                            .dkim = allocator.dupe(u8, rec.dkim_eval) catch continue,
-                            .spf = allocator.dupe(u8, rec.spf_eval) catch continue,
-                            .header_from = allocator.dupe(u8, rec.header_from) catch continue,
-                        }) catch {};
+                        result.dmarc_pass += rec.count;
                     }
                 }
             },
@@ -1074,17 +1074,16 @@ fn writeCheckText(
     // Failure pattern breakdown
     if (result.dkim_only_fail > 0 or result.spf_only_fail > 0 or result.both_fail > 0) {
         stdout_file.writeAll("\nFailure breakdown:\n") catch {};
-        if (result.both_fail > 0) {
-            const msg = std.fmt.bufPrint(&buf, "  DKIM+SPF fail: {d} messages (needs DKIM and SPF setup)\n", .{result.both_fail}) catch "";
-            stdout_file.writeAll(msg) catch {};
-        }
-        if (result.dkim_only_fail > 0) {
-            const msg = std.fmt.bufPrint(&buf, "  DKIM fail only: {d} messages (needs DKIM setup)\n", .{result.dkim_only_fail}) catch "";
-            stdout_file.writeAll(msg) catch {};
-        }
-        if (result.spf_only_fail > 0) {
-            const msg = std.fmt.bufPrint(&buf, "  SPF fail only:  {d} messages (needs SPF setup)\n", .{result.spf_only_fail}) catch "";
-            stdout_file.writeAll(msg) catch {};
+        const breakdown = [_]struct { ft: reports.stats.FailureType, count: u64 }{
+            .{ .ft = .both_fail, .count = result.both_fail },
+            .{ .ft = .dkim_only_fail, .count = result.dkim_only_fail },
+            .{ .ft = .spf_only_fail, .count = result.spf_only_fail },
+        };
+        for (breakdown) |b| {
+            if (b.count > 0) {
+                const msg = std.fmt.bufPrint(&buf, "  {s}: {d} messages ({s})\n", .{ b.ft.label(), b.count, b.ft.hint() }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
         }
     }
 
