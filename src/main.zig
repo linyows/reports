@@ -56,6 +56,8 @@ pub fn main() !void {
             return;
         }
         try cmdShow(allocator, args[2], format orelse "table", enrich);
+    } else if (std.mem.eql(u8, command, "dns")) {
+        try cmdDns(allocator, domain);
     } else if (std.mem.eql(u8, command, "domains")) {
         try cmdDomains(allocator, format orelse "table", account);
     } else if (std.mem.eql(u8, command, "summary")) {
@@ -275,6 +277,121 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     // Process fetched messages on main thread
     const counts = reports.fetch.processResults(allocator, job.results, &st, &fetched_set);
     return .{ .dmarc = counts.dmarc, .tls = counts.tls };
+}
+
+fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8) !void {
+    const cfg = try Config.load(allocator);
+    defer cfg.deinit(allocator);
+
+    // Collect domains from reports (or use filter)
+    var domains: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (domains.items) |d| allocator.free(d);
+        domains.deinit(allocator);
+    }
+
+    if (domain_filter) |d| {
+        domains.append(allocator, allocator.dupe(u8, d) catch return) catch {};
+    } else {
+        const entries = try loadEntries(allocator, &cfg, null);
+        defer reports.store.freeReportEntries(allocator, entries);
+
+        var domain_set = std.StringHashMap(void).init(allocator);
+        defer domain_set.deinit();
+        for (entries) |e| {
+            if (e.domain.len > 0) domain_set.put(e.domain, {}) catch {};
+        }
+        var it = domain_set.iterator();
+        while (it.next()) |kv| {
+            domains.append(allocator, allocator.dupe(u8, kv.key_ptr.*) catch continue) catch {};
+        }
+    }
+
+    for (domains.items) |domain| {
+        var buf: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&buf, "\n{s}\n", .{domain}) catch "";
+        stdout_file.writeAll(hdr) catch {};
+
+        // DMARC record
+        {
+            const qname = std.fmt.allocPrint(allocator, "_dmarc.{s}", .{domain}) catch continue;
+            defer allocator.free(qname);
+            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
+                defer allocator.free(txt);
+                const msg = std.fmt.bufPrint(&buf, "  DMARC:  {s}\n", .{txt}) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else |_| {
+                stdout_file.writeAll("  DMARC:  (not found)\n") catch {};
+            }
+        }
+
+        // SPF record — try up to 3 times since queryTxt returns one TXT at a time
+        // and SPF may not be the first TXT record for the domain
+        {
+            // Use dig-style approach: query and check if result contains v=spf1
+            var spf_found = false;
+            if (reports.ipinfo.queryTxt(allocator, domain)) |txt| {
+                defer allocator.free(txt);
+                if (std.mem.indexOf(u8, txt, "v=spf1") != null) {
+                    const msg = std.fmt.bufPrint(&buf, "  SPF:    {s}\n", .{txt}) catch "";
+                    stdout_file.writeAll(msg) catch {};
+                    spf_found = true;
+                }
+            } else |_| {}
+            if (!spf_found) {
+                stdout_file.writeAll("  SPF:    (not found — may exist as another TXT record)\n") catch {};
+            }
+        }
+
+        // DKIM record (try common selectors)
+        {
+            var found = false;
+            for ([_][]const u8{ "default", "google", "selector1", "selector2", "s1", "s2", "dkim", "mail" }) |selector| {
+                const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{ selector, domain }) catch continue;
+                defer allocator.free(qname);
+                if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
+                    defer allocator.free(txt);
+                    if (std.mem.indexOf(u8, txt, "DKIM1") != null or std.mem.indexOf(u8, txt, "p=") != null) {
+                        const trunc = if (txt.len > 60) txt[0..60] else txt;
+                        const msg = std.fmt.allocPrint(allocator, "  DKIM:   {s}... ({s}._domainkey)\n", .{ trunc, selector }) catch continue;
+                        defer allocator.free(msg);
+                        stdout_file.writeAll(msg) catch {};
+                        found = true;
+                        break;
+                    }
+                } else |_| {}
+            }
+            if (!found) {
+                stdout_file.writeAll("  DKIM:   (not found)\n") catch {};
+            }
+        }
+
+        // MTA-STS record
+        {
+            const qname = std.fmt.allocPrint(allocator, "_mta-sts.{s}", .{domain}) catch continue;
+            defer allocator.free(qname);
+            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
+                defer allocator.free(txt);
+                const msg = std.fmt.bufPrint(&buf, "  MTA-STS: {s}\n", .{txt}) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else |_| {
+                stdout_file.writeAll("  MTA-STS: (not found)\n") catch {};
+            }
+        }
+
+        // TLS-RPT record
+        {
+            const qname = std.fmt.allocPrint(allocator, "_smtp._tls.{s}", .{domain}) catch continue;
+            defer allocator.free(qname);
+            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
+                defer allocator.free(txt);
+                const msg = std.fmt.bufPrint(&buf, "  TLS-RPT: {s}\n", .{txt}) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else |_| {
+                stdout_file.writeAll("  TLS-RPT: (not found)\n") catch {};
+            }
+        }
+    }
 }
 
 fn cmdDomains(allocator: std.mem.Allocator, format: []const u8, account: ?[]const u8) !void {
@@ -631,6 +748,10 @@ const CheckResult = struct {
     dmarc_total: u64 = 0,
     dmarc_pass: u64 = 0,
     dmarc_fail: u64 = 0,
+    // Failure pattern breakdown
+    dkim_only_fail: u64 = 0, // DKIM fail, SPF pass
+    spf_only_fail: u64 = 0, // DKIM pass, SPF fail
+    both_fail: u64 = 0, // Both DKIM and SPF fail
     // TLS-RPT
     tls_reports: u64 = 0,
     tls_total_success: u64 = 0,
@@ -708,9 +829,16 @@ fn cmdCheck(
                     result.dmarc_total += rec.count;
                     const dkim_pass = std.mem.eql(u8, rec.dkim_eval, "pass");
                     const spf_pass = std.mem.eql(u8, rec.spf_eval, "pass");
-                    if (dkim_pass or spf_pass) {
+                    if (dkim_pass and spf_pass) {
                         result.dmarc_pass += rec.count;
+                    } else if (dkim_pass and !spf_pass) {
+                        result.dmarc_pass += rec.count; // DKIM pass is enough
+                        result.spf_only_fail += rec.count;
+                    } else if (!dkim_pass and spf_pass) {
+                        result.dmarc_pass += rec.count; // SPF pass is enough
+                        result.dkim_only_fail += rec.count;
                     } else {
+                        result.both_fail += rec.count;
                         result.dmarc_fail += rec.count;
                         dmarc_fails.append(allocator, .{
                             .account = entry.account_name,
@@ -859,6 +987,23 @@ fn writeCheckText(
     }) catch "";
     stdout_file.writeAll(status_msg) catch {};
 
+    // Failure pattern breakdown
+    if (result.dkim_only_fail > 0 or result.spf_only_fail > 0 or result.both_fail > 0) {
+        stdout_file.writeAll("\nFailure breakdown:\n") catch {};
+        if (result.both_fail > 0) {
+            const msg = std.fmt.bufPrint(&buf, "  DKIM+SPF fail: {d} messages (needs DKIM and SPF setup)\n", .{result.both_fail}) catch "";
+            stdout_file.writeAll(msg) catch {};
+        }
+        if (result.dkim_only_fail > 0) {
+            const msg = std.fmt.bufPrint(&buf, "  DKIM fail only: {d} messages (needs DKIM setup)\n", .{result.dkim_only_fail}) catch "";
+            stdout_file.writeAll(msg) catch {};
+        }
+        if (result.spf_only_fail > 0) {
+            const msg = std.fmt.bufPrint(&buf, "  SPF fail only:  {d} messages (needs SPF setup)\n", .{result.spf_only_fail}) catch "";
+            stdout_file.writeAll(msg) catch {};
+        }
+    }
+
     if (stale) {
         const stale_msg = std.fmt.bufPrint(&buf, "WARNING: No reports received in the last {d} days (latest: {s})\n", .{
             max_age, if (result.latest_date.len > 0) result.latest_date else "none",
@@ -932,8 +1077,8 @@ fn writeCheckJson(
     try buf.appendSlice(allocator, header);
 
     const dmarc_part = try std.fmt.allocPrint(allocator,
-        \\"dmarc":{{"reports":{d},"total":{d},"pass":{d},"fail":{d},"fail_rate":{d}}},
-    , .{ result.dmarc_reports, result.dmarc_total, result.dmarc_pass, result.dmarc_fail, dmarc_fail_rate });
+        \\"dmarc":{{"reports":{d},"total":{d},"pass":{d},"fail":{d},"fail_rate":{d},"dkim_only_fail":{d},"spf_only_fail":{d},"both_fail":{d}}},
+    , .{ result.dmarc_reports, result.dmarc_total, result.dmarc_pass, result.dmarc_fail, dmarc_fail_rate, result.dkim_only_fail, result.spf_only_fail, result.both_fail });
     defer allocator.free(dmarc_part);
     try buf.appendSlice(allocator, dmarc_part);
 
@@ -1630,6 +1775,7 @@ fn printUsage() void {
         \\  show <id>                    Show report details
         \\  summary                      Show summary statistics
         \\  check                        Check for anomalies (exit 0=OK, 1=WARN, 2=CRIT)
+        \\  dns                          Show DNS records (DMARC/SPF/DKIM/MTA-STS/TLS-RPT)
         \\  domains                      List domains
         \\  version                      Show version
         \\  help                         Show this help
