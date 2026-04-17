@@ -151,38 +151,6 @@ export fn reports_fetch_account(config_json: [*:0]const u8, account_name: [*:0]c
     return errStr("Account not found");
 }
 
-/// Escape a string for embedding in JSON. Returns the original slice if no escaping needed.
-fn jsonEscapeAlloc(input: []const u8) ?[]const u8 {
-    var needs_escape = false;
-    for (input) |ch| {
-        if (ch == '"' or ch == '\\' or ch < 0x20) {
-            needs_escape = true;
-            break;
-        }
-    }
-    if (!needs_escape) return input;
-
-    var buf: std.ArrayList(u8) = .empty;
-    for (input) |ch| {
-        switch (ch) {
-            '"' => buf.appendSlice(allocator, "\\\"") catch return null,
-            '\\' => buf.appendSlice(allocator, "\\\\") catch return null,
-            '\n' => buf.appendSlice(allocator, "\\n") catch return null,
-            '\r' => buf.appendSlice(allocator, "\\r") catch return null,
-            '\t' => buf.appendSlice(allocator, "\\t") catch return null,
-            else => if (ch < 0x20) {
-                buf.appendSlice(allocator, "\\u00") catch return null;
-                const hex = "0123456789abcdef";
-                buf.append(allocator, hex[ch >> 4]) catch return null;
-                buf.append(allocator, hex[ch & 0x0f]) catch return null;
-            } else {
-                buf.append(allocator, ch) catch return null;
-            },
-        }
-    }
-    return buf.toOwnedSlice(allocator) catch null;
-}
-
 fn errStr(msg: []const u8) ?[*:0]u8 {
     const duped = allocator.dupeZ(u8, msg) catch return null;
     return duped.ptr;
@@ -737,9 +705,9 @@ fn buildSourcesJson(data_dir: []const u8, entries: []const reports.store.ReportE
         }
 
         // JSON-escape enrichment strings that may contain quotes/backslashes
-        const esc_ptr = jsonEscapeAlloc(ptr_str) orelse ptr_str;
+        const esc_ptr = reports.stats.jsonEscape(allocator, ptr_str);
         defer if (esc_ptr.ptr != ptr_str.ptr) allocator.free(esc_ptr);
-        const esc_asn_org = jsonEscapeAlloc(asn_org_str) orelse asn_org_str;
+        const esc_asn_org = reports.stats.jsonEscape(allocator, asn_org_str);
         defer if (esc_asn_org.ptr != asn_org_str.ptr) allocator.free(esc_asn_org);
 
         const line = std.fmt.allocPrint(allocator, "{{\"ip\":\"{s}\",\"messages\":{d},\"dmarc_issues\":{d},\"tls_failures\":{d},\"types\":{s},\"domains\":{s},\"ptr\":\"{s}\",\"asn\":\"{s}\",\"asn_org\":\"{s}\",\"country\":\"{s}\"}}", .{

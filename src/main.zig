@@ -323,7 +323,7 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
     if (is_json) json_buf.appendSlice(allocator, "[") catch {};
 
     for (domains.items) |domain| {
-        var buf: [256]u8 = undefined;
+        var buf: [2048]u8 = undefined;
 
         // Query all records first to determine domain status
         var dmarc_txt: ?[]const u8 = null;
@@ -397,11 +397,17 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
             json_first = false;
 
             const status_str = dns_status.label();
-            const dmarc_s = if (dmarc_txt) |t| t else "";
-            const spf_s = if (spf_txt) |t| t else "";
-            const dkim_s = if (dkim_txt) |t| t else "";
-            const mta_s = if (mta_sts_txt) |t| t else "";
-            const tls_s = if (tls_rpt_txt) |t| t else "";
+            const esc = reports.stats.jsonEscape;
+            const dmarc_s = if (dmarc_txt) |t| esc(allocator, t) else "";
+            defer if (dmarc_txt != null and dmarc_s.ptr != dmarc_txt.?.ptr) allocator.free(dmarc_s);
+            const spf_s = if (spf_txt) |t| esc(allocator, t) else "";
+            defer if (spf_txt != null and spf_s.ptr != spf_txt.?.ptr) allocator.free(spf_s);
+            const dkim_s = if (dkim_txt) |t| esc(allocator, t) else "";
+            defer if (dkim_txt != null and dkim_s.ptr != dkim_txt.?.ptr) allocator.free(dkim_s);
+            const mta_s = if (mta_sts_txt) |t| esc(allocator, t) else "";
+            defer if (mta_sts_txt != null and mta_s.ptr != mta_sts_txt.?.ptr) allocator.free(mta_s);
+            const tls_s = if (tls_rpt_txt) |t| esc(allocator, t) else "";
+            defer if (tls_rpt_txt != null and tls_s.ptr != tls_rpt_txt.?.ptr) allocator.free(tls_s);
 
             const line = std.fmt.allocPrint(allocator, "{{\"domain\":\"{s}\",\"status\":\"{s}\",\"dmarc\":\"{s}\",\"spf\":\"{s}\",\"dkim\":\"{s}\",\"dkim_selector\":\"{s}\",\"mta_sts\":\"{s}\",\"tls_rpt\":\"{s}\"}}", .{
                 domain, status_str, dmarc_s, spf_s, dkim_s, dkim_selector, mta_s, tls_s,
@@ -1077,7 +1083,7 @@ fn writeCheckText(
 
     // Failure pattern breakdown
     if (result.dkim_only_fail > 0 or result.spf_only_fail > 0 or result.both_fail > 0) {
-        stdout_file.writeAll("\nFailure breakdown:\n") catch {};
+        stdout_file.writeAll("\nAuth mechanism breakdown (single-mechanism fails still pass DMARC):\n") catch {};
         const breakdown = [_]struct { ft: reports.stats.FailureType, count: u64 }{
             .{ .ft = .both_fail, .count = result.both_fail },
             .{ .ft = .dkim_only_fail, .count = result.dkim_only_fail },

@@ -598,6 +598,42 @@ test "hashIncOwned handles empty string key" {
     try std.testing.expectEqual(@as(u64, 8), map.get("").?);
 }
 
+// MARK: - JSON string escaping
+
+/// Escape a string for embedding in a JSON string value.
+/// Returns the original slice if no escaping is needed, or a new allocation.
+/// Caller must free the result if it differs from input.
+pub fn jsonEscape(alloc: Allocator, input: []const u8) []const u8 {
+    var needs_escape = false;
+    for (input) |ch| {
+        if (ch == '"' or ch == '\\' or ch < 0x20) {
+            needs_escape = true;
+            break;
+        }
+    }
+    if (!needs_escape) return input;
+
+    var out: std.ArrayList(u8) = .empty;
+    for (input) |ch| {
+        switch (ch) {
+            '"' => out.appendSlice(alloc, "\\\"") catch return input,
+            '\\' => out.appendSlice(alloc, "\\\\") catch return input,
+            '\n' => out.appendSlice(alloc, "\\n") catch return input,
+            '\r' => out.appendSlice(alloc, "\\r") catch return input,
+            '\t' => out.appendSlice(alloc, "\\t") catch return input,
+            else => if (ch < 0x20) {
+                const hex = "0123456789abcdef";
+                out.appendSlice(alloc, "\\u00") catch return input;
+                out.append(alloc, hex[ch >> 4]) catch return input;
+                out.append(alloc, hex[ch & 0x0f]) catch return input;
+            } else {
+                out.append(alloc, ch) catch return input;
+            },
+        }
+    }
+    return out.toOwnedSlice(alloc) catch input;
+}
+
 // MARK: - DNS status evaluation
 
 pub const DnsStatus = enum {
@@ -628,8 +664,24 @@ pub fn evaluateDnsStatus(
 }
 
 /// Check if a DMARC policy is weak (p=none means monitor-only, no enforcement).
+/// Carefully matches only the "p=" tag, not "sp=" or "np=".
 pub fn isDmarcPolicyWeak(dmarc_txt: []const u8) bool {
-    return std.mem.indexOf(u8, dmarc_txt, "p=none") != null;
+    var i: usize = 0;
+    while (i < dmarc_txt.len) {
+        // Find "p="
+        const pos = std.mem.indexOf(u8, dmarc_txt[i..], "p=") orelse return false;
+        const abs = i + pos;
+        // Make sure it's the "p" tag, not "sp=" or "np="
+        if (abs == 0 or dmarc_txt[abs - 1] == ';' or dmarc_txt[abs - 1] == ' ') {
+            // Check the value after "p="
+            const val_start = abs + 2;
+            if (val_start + 4 <= dmarc_txt.len and std.mem.eql(u8, dmarc_txt[val_start .. val_start + 4], "none")) {
+                return true;
+            }
+        }
+        i = abs + 2;
+    }
+    return false;
 }
 
 /// Check if an SPF record uses soft fail (~all instead of -all).
@@ -714,6 +766,18 @@ test "isDmarcPolicyWeak returns false for p=quarantine" {
 
 test "isDmarcPolicyWeak returns false for p=reject" {
     try std.testing.expect(!isDmarcPolicyWeak("v=DMARC1; p=reject; rua=mailto:x@example.com"));
+}
+
+test "isDmarcPolicyWeak returns false for sp=none with strong p" {
+    try std.testing.expect(!isDmarcPolicyWeak("v=DMARC1; p=reject; sp=none"));
+}
+
+test "isDmarcPolicyWeak returns false for np=none with strong p" {
+    try std.testing.expect(!isDmarcPolicyWeak("v=DMARC1; p=quarantine; np=none"));
+}
+
+test "isDmarcPolicyWeak detects p=none at start of record" {
+    try std.testing.expect(isDmarcPolicyWeak("p=none; rua=mailto:x@example.com"));
 }
 
 test "isSpfWeak detects ~all" {
