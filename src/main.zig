@@ -57,7 +57,7 @@ pub fn main() !void {
         }
         try cmdShow(allocator, args[2], format orelse "table", enrich);
     } else if (std.mem.eql(u8, command, "dns")) {
-        try cmdDns(allocator, domain);
+        try cmdDns(allocator, domain, format orelse "text");
     } else if (std.mem.eql(u8, command, "domains")) {
         try cmdDomains(allocator, format orelse "table", account);
     } else if (std.mem.eql(u8, command, "summary")) {
@@ -279,7 +279,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     return .{ .dmarc = counts.dmarc, .tls = counts.tls };
 }
 
-fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8) !void {
+fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []const u8) !void {
     const cfg = try Config.load(allocator);
     defer cfg.deinit(allocator);
 
@@ -307,90 +307,174 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8) !void {
         }
     }
 
+    const is_json = std.mem.eql(u8, format, "json");
+
+    const icon_green = "\x1b[38;2;194;255;38m●\x1b[0m";
+    const icon_yellow = "\x1b[38;2;255;200;0m●\x1b[0m";
+    const icon_red = "\x1b[38;2;255;51;102m●\x1b[0m";
+    const check_green = "\x1b[38;2;194;255;38m✓\x1b[0m ";
+    const check_yellow = "\x1b[38;2;255;200;0m!\x1b[0m ";
+    const check_red = "\x1b[38;2;255;51;102m✗\x1b[0m ";
+    const not_found = "\x1b[2m(not found)\x1b[0m";
+
+    var json_buf: std.ArrayList(u8) = .empty;
+    defer json_buf.deinit(allocator);
+    var json_first = true;
+    if (is_json) json_buf.appendSlice(allocator, "[") catch {};
+
     for (domains.items) |domain| {
         var buf: [256]u8 = undefined;
-        const hdr = std.fmt.bufPrint(&buf, "\n{s}\n", .{domain}) catch "";
-        stdout_file.writeAll(hdr) catch {};
 
-        // DMARC record
+        // Query all records first to determine domain status
+        var dmarc_txt: ?[]const u8 = null;
+        defer if (dmarc_txt) |t| allocator.free(t);
+        var spf_txt: ?[]const u8 = null;
+        defer if (spf_txt) |t| allocator.free(t);
+        var dkim_txt: ?[]const u8 = null;
+        defer if (dkim_txt) |t| allocator.free(t);
+        var dkim_selector: []const u8 = "";
+        var mta_sts_txt: ?[]const u8 = null;
+        defer if (mta_sts_txt) |t| allocator.free(t);
+        var tls_rpt_txt: ?[]const u8 = null;
+        defer if (tls_rpt_txt) |t| allocator.free(t);
+
+        // DMARC
         {
             const qname = std.fmt.allocPrint(allocator, "_dmarc.{s}", .{domain}) catch continue;
             defer allocator.free(qname);
-            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
-                defer allocator.free(txt);
-                const msg = std.fmt.bufPrint(&buf, "  DMARC:  {s}\n", .{txt}) catch "";
-                stdout_file.writeAll(msg) catch {};
-            } else |_| {
-                stdout_file.writeAll("  DMARC:  (not found)\n") catch {};
-            }
+            dmarc_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
         }
 
-        // SPF record — try up to 3 times since queryTxt returns one TXT at a time
-        // and SPF may not be the first TXT record for the domain
+        // SPF
         {
-            // Use dig-style approach: query and check if result contains v=spf1
-            var spf_found = false;
             if (reports.ipinfo.queryTxt(allocator, domain)) |txt| {
-                defer allocator.free(txt);
                 if (std.mem.indexOf(u8, txt, "v=spf1") != null) {
-                    const msg = std.fmt.bufPrint(&buf, "  SPF:    {s}\n", .{txt}) catch "";
-                    stdout_file.writeAll(msg) catch {};
-                    spf_found = true;
+                    spf_txt = txt;
+                } else {
+                    allocator.free(txt);
                 }
             } else |_| {}
-            if (!spf_found) {
-                stdout_file.writeAll("  SPF:    (not found — may exist as another TXT record)\n") catch {};
-            }
         }
 
-        // DKIM record (try common selectors)
-        {
-            var found = false;
-            for ([_][]const u8{ "default", "google", "selector1", "selector2", "s1", "s2", "dkim", "mail" }) |selector| {
-                const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{ selector, domain }) catch continue;
-                defer allocator.free(qname);
-                if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
-                    defer allocator.free(txt);
-                    if (std.mem.indexOf(u8, txt, "DKIM1") != null or std.mem.indexOf(u8, txt, "p=") != null) {
-                        const trunc = if (txt.len > 60) txt[0..60] else txt;
-                        const msg = std.fmt.allocPrint(allocator, "  DKIM:   {s}... ({s}._domainkey)\n", .{ trunc, selector }) catch continue;
-                        defer allocator.free(msg);
-                        stdout_file.writeAll(msg) catch {};
-                        found = true;
-                        break;
-                    }
-                } else |_| {}
-            }
-            if (!found) {
-                stdout_file.writeAll("  DKIM:   (not found)\n") catch {};
-            }
+        // DKIM
+        for ([_][]const u8{ "default", "google", "selector1", "selector2", "s1", "s2", "dkim", "mail" }) |selector| {
+            const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{ selector, domain }) catch continue;
+            defer allocator.free(qname);
+            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
+                if (std.mem.indexOf(u8, txt, "DKIM1") != null or std.mem.indexOf(u8, txt, "p=") != null) {
+                    dkim_txt = txt;
+                    dkim_selector = selector;
+                    break;
+                } else {
+                    allocator.free(txt);
+                }
+            } else |_| {}
         }
 
-        // MTA-STS record
+        // MTA-STS
         {
             const qname = std.fmt.allocPrint(allocator, "_mta-sts.{s}", .{domain}) catch continue;
             defer allocator.free(qname);
-            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
-                defer allocator.free(txt);
-                const msg = std.fmt.bufPrint(&buf, "  MTA-STS: {s}\n", .{txt}) catch "";
-                stdout_file.writeAll(msg) catch {};
-            } else |_| {
-                stdout_file.writeAll("  MTA-STS: (not found)\n") catch {};
-            }
+            mta_sts_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
         }
 
-        // TLS-RPT record
+        // TLS-RPT
         {
             const qname = std.fmt.allocPrint(allocator, "_smtp._tls.{s}", .{domain}) catch continue;
             defer allocator.free(qname);
-            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
-                defer allocator.free(txt);
-                const msg = std.fmt.bufPrint(&buf, "  TLS-RPT: {s}\n", .{txt}) catch "";
-                stdout_file.writeAll(msg) catch {};
-            } else |_| {
-                stdout_file.writeAll("  TLS-RPT: (not found)\n") catch {};
-            }
+            tls_rpt_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
         }
+
+        const dmarc_policy_weak = if (dmarc_txt) |t| std.mem.indexOf(u8, t, "p=none") != null else false;
+        const spf_weak = if (spf_txt) |t| std.mem.indexOf(u8, t, "~all") != null else false;
+        const has_dmarc = dmarc_txt != null;
+        const has_spf = spf_txt != null;
+        const has_dkim = dkim_txt != null;
+
+        if (is_json) {
+            if (!json_first) json_buf.appendSlice(allocator, ",") catch continue;
+            json_first = false;
+
+            const status_str: []const u8 = if (!has_dmarc or !has_spf or !has_dkim) "critical" else if (dmarc_policy_weak or spf_weak) "warning" else "ok";
+            const dmarc_s = if (dmarc_txt) |t| t else "";
+            const spf_s = if (spf_txt) |t| t else "";
+            const dkim_s = if (dkim_txt) |t| t else "";
+            const mta_s = if (mta_sts_txt) |t| t else "";
+            const tls_s = if (tls_rpt_txt) |t| t else "";
+
+            const line = std.fmt.allocPrint(allocator, "{{\"domain\":\"{s}\",\"status\":\"{s}\",\"dmarc\":\"{s}\",\"spf\":\"{s}\",\"dkim\":\"{s}\",\"dkim_selector\":\"{s}\",\"mta_sts\":\"{s}\",\"tls_rpt\":\"{s}\"}}", .{
+                domain, status_str, dmarc_s, spf_s, dkim_s, dkim_selector, mta_s, tls_s,
+            }) catch continue;
+            defer allocator.free(line);
+            json_buf.appendSlice(allocator, line) catch continue;
+        } else {
+            const icon = if (!has_dmarc or !has_spf or !has_dkim)
+                icon_red
+            else if (dmarc_policy_weak or spf_weak)
+                icon_yellow
+            else
+                icon_green;
+
+            // Print domain header
+            const hdr = std.fmt.bufPrint(&buf, " {s} {s}\n", .{ icon, domain }) catch "";
+            stdout_file.writeAll(hdr) catch {};
+
+            // DMARC
+            if (dmarc_txt) |txt| {
+                const ci = if (dmarc_policy_weak) check_yellow else check_green;
+                const msg = std.fmt.bufPrint(&buf, "   {s} DMARC:   {s}\n", .{ ci, txt }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} DMARC:   {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            // SPF
+            if (spf_txt) |txt| {
+                const ci = if (spf_weak) check_yellow else check_green;
+                const msg = std.fmt.bufPrint(&buf, "   {s} SPF:     {s}\n", .{ ci, txt }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} SPF:     {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            // DKIM
+            if (dkim_txt) |txt| {
+                const trunc = if (txt.len > 60) txt[0..60] else txt;
+                const msg = std.fmt.allocPrint(allocator, "   {s} DKIM:    {s}... ({s}._domainkey)\n", .{ check_green, trunc, dkim_selector }) catch continue;
+                defer allocator.free(msg);
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} DKIM:    {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            // MTA-STS
+            if (mta_sts_txt) |txt| {
+                const msg = std.fmt.bufPrint(&buf, "   {s} MTA-STS: {s}\n", .{ check_green, txt }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} MTA-STS: {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            // TLS-RPT
+            if (tls_rpt_txt) |txt| {
+                const msg = std.fmt.bufPrint(&buf, "   {s} TLS-RPT: {s}\n", .{ check_green, txt }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} TLS-RPT: {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            stdout_file.writeAll("\n") catch {};
+        }
+    }
+
+    if (is_json) {
+        json_buf.appendSlice(allocator, "]\n") catch {};
+        stdout_file.writeAll(json_buf.items) catch {};
     }
 }
 
