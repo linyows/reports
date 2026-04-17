@@ -920,6 +920,7 @@ fn cmdCheck(
                             .spf_only_fail => result.spf_only_fail += rec.count,
                         }
                         if (ft == .both_fail) {
+                            // Only both-fail counts as DMARC failure
                             result.dmarc_fail += rec.count;
                             dmarc_fails.append(allocator, .{
                                 .account = entry.account_name,
@@ -931,6 +932,9 @@ fn cmdCheck(
                                 .spf = allocator.dupe(u8, rec.spf_eval) catch continue,
                                 .header_from = allocator.dupe(u8, rec.header_from) catch continue,
                             }) catch {};
+                        } else {
+                            // Single-mechanism fail still passes DMARC (one pass is enough)
+                            result.dmarc_pass += rec.count;
                         }
                     } else {
                         result.dmarc_pass += rec.count;
