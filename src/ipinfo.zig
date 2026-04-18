@@ -302,7 +302,7 @@ fn parseCymruAsnOrg(allocator: Allocator, txt: []const u8) ?[]const u8 {
 
 // --- DNS TXT query via raw UDP ---
 
-fn queryTxt(allocator: Allocator, name: []const u8) ![]const u8 {
+pub fn queryTxt(allocator: Allocator, name: []const u8) ![]const u8 {
     const ns_ip = getNameserver(allocator) catch try allocator.dupe(u8, "8.8.8.8");
     defer allocator.free(ns_ip);
 

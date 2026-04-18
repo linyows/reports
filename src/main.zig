@@ -56,6 +56,8 @@ pub fn main() !void {
             return;
         }
         try cmdShow(allocator, args[2], format orelse "table", enrich);
+    } else if (std.mem.eql(u8, command, "dns")) {
+        try cmdDns(allocator, domain, format orelse "text");
     } else if (std.mem.eql(u8, command, "domains")) {
         try cmdDomains(allocator, format orelse "table", account);
     } else if (std.mem.eql(u8, command, "summary")) {
@@ -275,6 +277,211 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     // Process fetched messages on main thread
     const counts = reports.fetch.processResults(allocator, job.results, &st, &fetched_set);
     return .{ .dmarc = counts.dmarc, .tls = counts.tls };
+}
+
+fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []const u8) !void {
+    const cfg = try Config.load(allocator);
+    defer cfg.deinit(allocator);
+
+    // Collect domains from reports (or use filter)
+    var domains: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (domains.items) |d| allocator.free(d);
+        domains.deinit(allocator);
+    }
+
+    if (domain_filter) |d| {
+        domains.append(allocator, allocator.dupe(u8, d) catch return) catch {};
+    } else {
+        const entries = try loadEntries(allocator, &cfg, null);
+        defer reports.store.freeReportEntries(allocator, entries);
+
+        var domain_set = std.StringHashMap(void).init(allocator);
+        defer domain_set.deinit();
+        for (entries) |e| {
+            if (e.domain.len > 0) domain_set.put(e.domain, {}) catch {};
+        }
+        var it = domain_set.iterator();
+        while (it.next()) |kv| {
+            domains.append(allocator, allocator.dupe(u8, kv.key_ptr.*) catch continue) catch {};
+        }
+    }
+
+    const is_json = std.mem.eql(u8, format, "json");
+
+    const icon_green = "\x1b[38;2;194;255;38m●\x1b[0m";
+    const icon_yellow = "\x1b[38;2;255;200;0m●\x1b[0m";
+    const icon_red = "\x1b[38;2;255;51;102m●\x1b[0m";
+    const check_green = "\x1b[38;2;194;255;38m✓\x1b[0m ";
+    const check_yellow = "\x1b[38;2;255;200;0m△\x1b[0m ";
+    const check_red = "\x1b[38;2;255;51;102m✗\x1b[0m ";
+    const not_found = "\x1b[2m(not found)\x1b[0m";
+
+    var json_buf: std.ArrayList(u8) = .empty;
+    defer json_buf.deinit(allocator);
+    var json_first = true;
+    if (is_json) json_buf.appendSlice(allocator, "[") catch {};
+
+    for (domains.items) |domain| {
+        var buf: [2048]u8 = undefined;
+
+        // Query all records first to determine domain status
+        var dmarc_txt: ?[]const u8 = null;
+        defer if (dmarc_txt) |t| allocator.free(t);
+        var spf_txt: ?[]const u8 = null;
+        defer if (spf_txt) |t| allocator.free(t);
+        var dkim_txt: ?[]const u8 = null;
+        defer if (dkim_txt) |t| allocator.free(t);
+        var dkim_selector: []const u8 = "";
+        var mta_sts_txt: ?[]const u8 = null;
+        defer if (mta_sts_txt) |t| allocator.free(t);
+        var tls_rpt_txt: ?[]const u8 = null;
+        defer if (tls_rpt_txt) |t| allocator.free(t);
+
+        // DMARC
+        {
+            const qname = std.fmt.allocPrint(allocator, "_dmarc.{s}", .{domain}) catch continue;
+            defer allocator.free(qname);
+            dmarc_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
+        }
+
+        // SPF
+        {
+            if (reports.ipinfo.queryTxt(allocator, domain)) |txt| {
+                if (std.mem.indexOf(u8, txt, "v=spf1") != null) {
+                    spf_txt = txt;
+                } else {
+                    allocator.free(txt);
+                }
+            } else |_| {}
+        }
+
+        // DKIM
+        for ([_][]const u8{ "default", "google", "selector1", "selector2", "s1", "s2", "dkim", "mail" }) |selector| {
+            const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{ selector, domain }) catch continue;
+            defer allocator.free(qname);
+            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
+                if (std.mem.indexOf(u8, txt, "DKIM1") != null or std.mem.indexOf(u8, txt, "p=") != null) {
+                    dkim_txt = txt;
+                    dkim_selector = selector;
+                    break;
+                } else {
+                    allocator.free(txt);
+                }
+            } else |_| {}
+        }
+
+        // MTA-STS
+        {
+            const qname = std.fmt.allocPrint(allocator, "_mta-sts.{s}", .{domain}) catch continue;
+            defer allocator.free(qname);
+            mta_sts_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
+        }
+
+        // TLS-RPT
+        {
+            const qname = std.fmt.allocPrint(allocator, "_smtp._tls.{s}", .{domain}) catch continue;
+            defer allocator.free(qname);
+            tls_rpt_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
+        }
+
+        const dmarc_policy_weak = if (dmarc_txt) |t| reports.stats.isDmarcPolicyWeak(t) else false;
+        const spf_weak = if (spf_txt) |t| reports.stats.isSpfWeak(t) else false;
+        const has_dmarc = dmarc_txt != null;
+        const has_spf = spf_txt != null;
+        const has_dkim = dkim_txt != null;
+        const dns_status = reports.stats.evaluateDnsStatus(has_dmarc, has_spf, has_dkim, dmarc_policy_weak, spf_weak);
+
+        if (is_json) {
+            if (!json_first) json_buf.appendSlice(allocator, ",") catch continue;
+            json_first = false;
+
+            const status_str = dns_status.label();
+            const esc = reports.stats.jsonEscape;
+            const dmarc_s = if (dmarc_txt) |t| esc(allocator, t) else "";
+            defer if (dmarc_txt != null and dmarc_s.ptr != dmarc_txt.?.ptr) allocator.free(dmarc_s);
+            const spf_s = if (spf_txt) |t| esc(allocator, t) else "";
+            defer if (spf_txt != null and spf_s.ptr != spf_txt.?.ptr) allocator.free(spf_s);
+            const dkim_s = if (dkim_txt) |t| esc(allocator, t) else "";
+            defer if (dkim_txt != null and dkim_s.ptr != dkim_txt.?.ptr) allocator.free(dkim_s);
+            const mta_s = if (mta_sts_txt) |t| esc(allocator, t) else "";
+            defer if (mta_sts_txt != null and mta_s.ptr != mta_sts_txt.?.ptr) allocator.free(mta_s);
+            const tls_s = if (tls_rpt_txt) |t| esc(allocator, t) else "";
+            defer if (tls_rpt_txt != null and tls_s.ptr != tls_rpt_txt.?.ptr) allocator.free(tls_s);
+
+            const line = std.fmt.allocPrint(allocator, "{{\"domain\":\"{s}\",\"status\":\"{s}\",\"dmarc\":\"{s}\",\"spf\":\"{s}\",\"dkim\":\"{s}\",\"dkim_selector\":\"{s}\",\"mta_sts\":\"{s}\",\"tls_rpt\":\"{s}\"}}", .{
+                domain, status_str, dmarc_s, spf_s, dkim_s, dkim_selector, mta_s, tls_s,
+            }) catch continue;
+            defer allocator.free(line);
+            json_buf.appendSlice(allocator, line) catch continue;
+        } else {
+            const icon = switch (dns_status) {
+                .ok => icon_green,
+                .warning => icon_yellow,
+                .critical => icon_red,
+            };
+
+            // Print domain header
+            const hdr = std.fmt.bufPrint(&buf, " {s} {s}\n", .{ icon, domain }) catch "";
+            stdout_file.writeAll(hdr) catch {};
+
+            // DMARC
+            if (dmarc_txt) |txt| {
+                const ci = if (dmarc_policy_weak) check_yellow else check_green;
+                const msg = std.fmt.bufPrint(&buf, "   {s} DMARC:   {s}\n", .{ ci, txt }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} DMARC:   {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            // SPF
+            if (spf_txt) |txt| {
+                const ci = if (spf_weak) check_yellow else check_green;
+                const msg = std.fmt.bufPrint(&buf, "   {s} SPF:     {s}\n", .{ ci, txt }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} SPF:     {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            // DKIM
+            if (dkim_txt) |txt| {
+                const trunc = if (txt.len > 60) txt[0..60] else txt;
+                const msg = std.fmt.allocPrint(allocator, "   {s} DKIM:    {s}... ({s}._domainkey)\n", .{ check_green, trunc, dkim_selector }) catch continue;
+                defer allocator.free(msg);
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} DKIM:    {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            // MTA-STS
+            if (mta_sts_txt) |txt| {
+                const msg = std.fmt.bufPrint(&buf, "   {s} MTA-STS: {s}\n", .{ check_green, txt }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} MTA-STS: {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            // TLS-RPT
+            if (tls_rpt_txt) |txt| {
+                const msg = std.fmt.bufPrint(&buf, "   {s} TLS-RPT: {s}\n", .{ check_green, txt }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            } else {
+                const msg = std.fmt.bufPrint(&buf, "   {s} TLS-RPT: {s}\n", .{ check_red, not_found }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+
+            stdout_file.writeAll("\n") catch {};
+        }
+    }
+
+    if (is_json) {
+        json_buf.appendSlice(allocator, "]\n") catch {};
+        stdout_file.writeAll(json_buf.items) catch {};
+    }
 }
 
 fn cmdDomains(allocator: std.mem.Allocator, format: []const u8, account: ?[]const u8) !void {
@@ -631,6 +838,10 @@ const CheckResult = struct {
     dmarc_total: u64 = 0,
     dmarc_pass: u64 = 0,
     dmarc_fail: u64 = 0,
+    // Failure pattern breakdown
+    dkim_only_fail: u64 = 0, // DKIM fail, SPF pass
+    spf_only_fail: u64 = 0, // DKIM pass, SPF fail
+    both_fail: u64 = 0, // Both DKIM and SPF fail
     // TLS-RPT
     tls_reports: u64 = 0,
     tls_total_success: u64 = 0,
@@ -708,20 +919,31 @@ fn cmdCheck(
                     result.dmarc_total += rec.count;
                     const dkim_pass = std.mem.eql(u8, rec.dkim_eval, "pass");
                     const spf_pass = std.mem.eql(u8, rec.spf_eval, "pass");
-                    if (dkim_pass or spf_pass) {
-                        result.dmarc_pass += rec.count;
+                    if (reports.stats.classifyFailure(dkim_pass, spf_pass)) |ft| {
+                        switch (ft) {
+                            .both_fail => result.both_fail += rec.count,
+                            .dkim_only_fail => result.dkim_only_fail += rec.count,
+                            .spf_only_fail => result.spf_only_fail += rec.count,
+                        }
+                        if (ft == .both_fail) {
+                            // Only both-fail counts as DMARC failure
+                            result.dmarc_fail += rec.count;
+                            dmarc_fails.append(allocator, .{
+                                .account = entry.account_name,
+                                .domain = entry.domain,
+                                .org = entry.org_name,
+                                .source_ip = allocator.dupe(u8, rec.source_ip) catch continue,
+                                .count = rec.count,
+                                .dkim = allocator.dupe(u8, rec.dkim_eval) catch continue,
+                                .spf = allocator.dupe(u8, rec.spf_eval) catch continue,
+                                .header_from = allocator.dupe(u8, rec.header_from) catch continue,
+                            }) catch {};
+                        } else {
+                            // Single-mechanism fail still passes DMARC (one pass is enough)
+                            result.dmarc_pass += rec.count;
+                        }
                     } else {
-                        result.dmarc_fail += rec.count;
-                        dmarc_fails.append(allocator, .{
-                            .account = entry.account_name,
-                            .domain = entry.domain,
-                            .org = entry.org_name,
-                            .source_ip = allocator.dupe(u8, rec.source_ip) catch continue,
-                            .count = rec.count,
-                            .dkim = allocator.dupe(u8, rec.dkim_eval) catch continue,
-                            .spf = allocator.dupe(u8, rec.spf_eval) catch continue,
-                            .header_from = allocator.dupe(u8, rec.header_from) catch continue,
-                        }) catch {};
+                        result.dmarc_pass += rec.count;
                     }
                 }
             },
@@ -859,6 +1081,22 @@ fn writeCheckText(
     }) catch "";
     stdout_file.writeAll(status_msg) catch {};
 
+    // Failure pattern breakdown
+    if (result.dkim_only_fail > 0 or result.spf_only_fail > 0 or result.both_fail > 0) {
+        stdout_file.writeAll("\nAuth mechanism breakdown (single-mechanism fails still pass DMARC):\n") catch {};
+        const breakdown = [_]struct { ft: reports.stats.FailureType, count: u64 }{
+            .{ .ft = .both_fail, .count = result.both_fail },
+            .{ .ft = .dkim_only_fail, .count = result.dkim_only_fail },
+            .{ .ft = .spf_only_fail, .count = result.spf_only_fail },
+        };
+        for (breakdown) |b| {
+            if (b.count > 0) {
+                const msg = std.fmt.bufPrint(&buf, "  {s}: {d} messages ({s})\n", .{ b.ft.label(), b.count, b.ft.hint() }) catch "";
+                stdout_file.writeAll(msg) catch {};
+            }
+        }
+    }
+
     if (stale) {
         const stale_msg = std.fmt.bufPrint(&buf, "WARNING: No reports received in the last {d} days (latest: {s})\n", .{
             max_age, if (result.latest_date.len > 0) result.latest_date else "none",
@@ -932,8 +1170,8 @@ fn writeCheckJson(
     try buf.appendSlice(allocator, header);
 
     const dmarc_part = try std.fmt.allocPrint(allocator,
-        \\"dmarc":{{"reports":{d},"total":{d},"pass":{d},"fail":{d},"fail_rate":{d}}},
-    , .{ result.dmarc_reports, result.dmarc_total, result.dmarc_pass, result.dmarc_fail, dmarc_fail_rate });
+        \\"dmarc":{{"reports":{d},"total":{d},"pass":{d},"fail":{d},"fail_rate":{d},"dkim_only_fail":{d},"spf_only_fail":{d},"both_fail":{d}}},
+    , .{ result.dmarc_reports, result.dmarc_total, result.dmarc_pass, result.dmarc_fail, dmarc_fail_rate, result.dkim_only_fail, result.spf_only_fail, result.both_fail });
     defer allocator.free(dmarc_part);
     try buf.appendSlice(allocator, dmarc_part);
 
@@ -1630,6 +1868,7 @@ fn printUsage() void {
         \\  show <id>                    Show report details
         \\  summary                      Show summary statistics
         \\  check                        Check for anomalies (exit 0=OK, 1=WARN, 2=CRIT)
+        \\  dns                          Show DNS records (DMARC/SPF/DKIM/MTA-STS/TLS-RPT)
         \\  domains                      List domains
         \\  version                      Show version
         \\  help                         Show this help

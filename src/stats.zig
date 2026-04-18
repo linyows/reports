@@ -597,3 +597,209 @@ test "hashIncOwned handles empty string key" {
     hashIncOwned(alloc, &map, "", 3);
     try std.testing.expectEqual(@as(u64, 8), map.get("").?);
 }
+
+// MARK: - JSON string escaping
+
+/// Escape a string for embedding in a JSON string value.
+/// Returns the original slice if no escaping is needed, or a new allocation.
+/// Caller must free the result if it differs from input.
+pub fn jsonEscape(alloc: Allocator, input: []const u8) []const u8 {
+    var needs_escape = false;
+    for (input) |ch| {
+        if (ch == '"' or ch == '\\' or ch < 0x20) {
+            needs_escape = true;
+            break;
+        }
+    }
+    if (!needs_escape) return input;
+
+    var out: std.ArrayList(u8) = .empty;
+    for (input) |ch| {
+        switch (ch) {
+            '"' => out.appendSlice(alloc, "\\\"") catch return input,
+            '\\' => out.appendSlice(alloc, "\\\\") catch return input,
+            '\n' => out.appendSlice(alloc, "\\n") catch return input,
+            '\r' => out.appendSlice(alloc, "\\r") catch return input,
+            '\t' => out.appendSlice(alloc, "\\t") catch return input,
+            else => if (ch < 0x20) {
+                const hex = "0123456789abcdef";
+                out.appendSlice(alloc, "\\u00") catch return input;
+                out.append(alloc, hex[ch >> 4]) catch return input;
+                out.append(alloc, hex[ch & 0x0f]) catch return input;
+            } else {
+                out.append(alloc, ch) catch return input;
+            },
+        }
+    }
+    return out.toOwnedSlice(alloc) catch input;
+}
+
+// MARK: - DNS status evaluation
+
+pub const DnsStatus = enum {
+    ok,
+    warning,
+    critical,
+
+    pub fn label(self: DnsStatus) []const u8 {
+        return switch (self) {
+            .ok => "ok",
+            .warning => "warning",
+            .critical => "critical",
+        };
+    }
+};
+
+/// Evaluate overall DNS health for a domain based on record presence and strength.
+pub fn evaluateDnsStatus(
+    has_dmarc: bool,
+    has_spf: bool,
+    has_dkim: bool,
+    dmarc_policy_weak: bool,
+    spf_weak: bool,
+) DnsStatus {
+    if (!has_dmarc or !has_spf or !has_dkim) return .critical;
+    if (dmarc_policy_weak or spf_weak) return .warning;
+    return .ok;
+}
+
+/// Check if a DMARC policy is weak (p=none means monitor-only, no enforcement).
+/// Carefully matches only the "p=" tag, not "sp=" or "np=".
+pub fn isDmarcPolicyWeak(dmarc_txt: []const u8) bool {
+    var i: usize = 0;
+    while (i < dmarc_txt.len) {
+        // Find "p="
+        const pos = std.mem.indexOf(u8, dmarc_txt[i..], "p=") orelse return false;
+        const abs = i + pos;
+        // Make sure it's the "p" tag, not "sp=" or "np="
+        if (abs == 0 or dmarc_txt[abs - 1] == ';' or dmarc_txt[abs - 1] == ' ') {
+            // Check the value after "p="
+            const val_start = abs + 2;
+            if (val_start + 4 <= dmarc_txt.len and std.mem.eql(u8, dmarc_txt[val_start .. val_start + 4], "none")) {
+                return true;
+            }
+        }
+        i = abs + 2;
+    }
+    return false;
+}
+
+/// Check if an SPF record uses soft fail (~all instead of -all).
+pub fn isSpfWeak(spf_txt: []const u8) bool {
+    return std.mem.indexOf(u8, spf_txt, "~all") != null;
+}
+
+// MARK: - DMARC failure classification
+
+pub const FailureType = enum {
+    both_fail,
+    dkim_only_fail,
+    spf_only_fail,
+
+    pub fn label(self: FailureType) []const u8 {
+        return switch (self) {
+            .both_fail => "DKIM+SPF fail",
+            .dkim_only_fail => "DKIM fail only",
+            .spf_only_fail => "SPF fail only",
+        };
+    }
+
+    pub fn hint(self: FailureType) []const u8 {
+        return switch (self) {
+            .both_fail => "needs DKIM and SPF setup",
+            .dkim_only_fail => "needs DKIM setup",
+            .spf_only_fail => "needs SPF setup",
+        };
+    }
+};
+
+/// Classify a DMARC failure based on DKIM and SPF evaluation results.
+/// Returns null if both pass (not a failure).
+pub fn classifyFailure(dkim_pass: bool, spf_pass: bool) ?FailureType {
+    if (dkim_pass and spf_pass) return null;
+    if (!dkim_pass and !spf_pass) return .both_fail;
+    if (!dkim_pass) return .dkim_only_fail;
+    return .spf_only_fail;
+}
+
+// MARK: - DNS status tests
+
+test "evaluateDnsStatus returns ok when all records present and strong" {
+    try std.testing.expectEqual(DnsStatus.ok, evaluateDnsStatus(true, true, true, false, false));
+}
+
+test "evaluateDnsStatus returns warning for weak DMARC policy" {
+    try std.testing.expectEqual(DnsStatus.warning, evaluateDnsStatus(true, true, true, true, false));
+}
+
+test "evaluateDnsStatus returns warning for weak SPF" {
+    try std.testing.expectEqual(DnsStatus.warning, evaluateDnsStatus(true, true, true, false, true));
+}
+
+test "evaluateDnsStatus returns warning when both weak" {
+    try std.testing.expectEqual(DnsStatus.warning, evaluateDnsStatus(true, true, true, true, true));
+}
+
+test "evaluateDnsStatus returns critical when DKIM missing" {
+    try std.testing.expectEqual(DnsStatus.critical, evaluateDnsStatus(true, true, false, false, false));
+}
+
+test "evaluateDnsStatus returns critical when DMARC missing" {
+    try std.testing.expectEqual(DnsStatus.critical, evaluateDnsStatus(false, true, true, false, false));
+}
+
+test "evaluateDnsStatus returns critical when SPF missing" {
+    try std.testing.expectEqual(DnsStatus.critical, evaluateDnsStatus(true, false, true, false, false));
+}
+
+test "evaluateDnsStatus returns critical over warning when record missing and weak" {
+    try std.testing.expectEqual(DnsStatus.critical, evaluateDnsStatus(true, true, false, true, true));
+}
+
+test "isDmarcPolicyWeak detects p=none" {
+    try std.testing.expect(isDmarcPolicyWeak("v=DMARC1; p=none; rua=mailto:x@example.com"));
+}
+
+test "isDmarcPolicyWeak returns false for p=quarantine" {
+    try std.testing.expect(!isDmarcPolicyWeak("v=DMARC1; p=quarantine; rua=mailto:x@example.com"));
+}
+
+test "isDmarcPolicyWeak returns false for p=reject" {
+    try std.testing.expect(!isDmarcPolicyWeak("v=DMARC1; p=reject; rua=mailto:x@example.com"));
+}
+
+test "isDmarcPolicyWeak returns false for sp=none with strong p" {
+    try std.testing.expect(!isDmarcPolicyWeak("v=DMARC1; p=reject; sp=none"));
+}
+
+test "isDmarcPolicyWeak returns false for np=none with strong p" {
+    try std.testing.expect(!isDmarcPolicyWeak("v=DMARC1; p=quarantine; np=none"));
+}
+
+test "isDmarcPolicyWeak detects p=none at start of record" {
+    try std.testing.expect(isDmarcPolicyWeak("p=none; rua=mailto:x@example.com"));
+}
+
+test "isSpfWeak detects ~all" {
+    try std.testing.expect(isSpfWeak("v=spf1 include:_spf.google.com ~all"));
+}
+
+test "isSpfWeak returns false for -all" {
+    try std.testing.expect(!isSpfWeak("v=spf1 ip4:1.2.3.4 -all"));
+}
+
+test "classifyFailure returns null when both pass" {
+    try std.testing.expectEqual(@as(?FailureType, null), classifyFailure(true, true));
+}
+
+test "classifyFailure returns both_fail" {
+    try std.testing.expectEqual(FailureType.both_fail, classifyFailure(false, false).?);
+}
+
+test "classifyFailure returns dkim_only_fail" {
+    try std.testing.expectEqual(FailureType.dkim_only_fail, classifyFailure(false, true).?);
+}
+
+test "classifyFailure returns spf_only_fail" {
+    try std.testing.expectEqual(FailureType.spf_only_fail, classifyFailure(true, false).?);
+}
