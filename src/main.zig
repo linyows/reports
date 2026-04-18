@@ -313,7 +313,7 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
     const icon_yellow = "\x1b[38;2;255;200;0m●\x1b[0m";
     const icon_red = "\x1b[38;2;255;51;102m●\x1b[0m";
     const check_green = "\x1b[38;2;194;255;38m✓\x1b[0m ";
-    const check_yellow = "\x1b[38;2;255;200;0m!\x1b[0m ";
+    const check_yellow = "\x1b[38;2;255;200;0m△\x1b[0m ";
     const check_red = "\x1b[38;2;255;51;102m✗\x1b[0m ";
     const not_found = "\x1b[2m(not found)\x1b[0m";
 
