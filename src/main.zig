@@ -335,12 +335,12 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
 
     const is_json = std.mem.eql(u8, format, "json");
 
-    const icon_green = neon_yellow ++ "●" ++ reset;
-    const icon_yellow = warn_yellow ++ "●" ++ reset;
-    const icon_red = fail_red ++ "●" ++ reset;
-    const check_green = neon_yellow ++ "✓" ++ reset ++ " ";
-    const check_yellow = warn_yellow ++ "△" ++ reset ++ " ";
-    const check_red = fail_red ++ "✗" ++ reset ++ " ";
+    const icon_ok = neon_yellow ++ "●" ++ reset;
+    const icon_warning = warn_yellow ++ "●" ++ reset;
+    const icon_critical = fail_red ++ "●" ++ reset;
+    const check_ok = neon_yellow ++ "✓" ++ reset ++ " ";
+    const check_warning = warn_yellow ++ "△" ++ reset ++ " ";
+    const check_critical = fail_red ++ "✗" ++ reset ++ " ";
     const not_found = dim ++ "(not found)" ++ reset;
 
     var json_buf: std.ArrayList(u8) = .empty;
@@ -442,9 +442,9 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
             json_buf.appendSlice(allocator, line) catch continue;
         } else {
             const icon = switch (dns_status) {
-                .ok => icon_green,
-                .warning => icon_yellow,
-                .critical => icon_red,
+                .ok => icon_ok,
+                .warning => icon_warning,
+                .critical => icon_critical,
             };
 
             // Print domain header
@@ -453,50 +453,50 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
 
             // DMARC
             if (dmarc_txt) |txt| {
-                const ci = if (dmarc_policy_weak) check_yellow else check_green;
+                const ci = if (dmarc_policy_weak) check_warning else check_ok;
                 const msg = std.fmt.bufPrint(&buf, branch_prefix ++ "{s} DMARC:   {s}\n", .{ ci, txt }) catch "";
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, branch_prefix ++ "{s} DMARC:   {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, branch_prefix ++ "{s} DMARC:   {s}\n", .{ check_critical, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
             // SPF
             if (spf_txt) |txt| {
-                const ci = if (spf_weak) check_yellow else check_green;
+                const ci = if (spf_weak) check_warning else check_ok;
                 const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} SPF:     {s}\n", .{ ci, txt }) catch "";
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} SPF:     {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} SPF:     {s}\n", .{ check_critical, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
             // DKIM
             if (dkim_txt) |txt| {
                 const trunc = if (txt.len > 60) txt[0..60] else txt;
-                const msg = std.fmt.allocPrint(allocator, detail_prefix ++ "{s} DKIM:    {s}... ({s}._domainkey)\n", .{ check_green, trunc, dkim_selector }) catch continue;
+                const msg = std.fmt.allocPrint(allocator, detail_prefix ++ "{s} DKIM:    {s}... ({s}._domainkey)\n", .{ check_ok, trunc, dkim_selector }) catch continue;
                 defer allocator.free(msg);
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} DKIM:    {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} DKIM:    {s}\n", .{ check_critical, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
             // MTA-STS
             if (mta_sts_txt) |txt| {
-                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} MTA-STS: {s}\n", .{ check_green, txt }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} MTA-STS: {s}\n", .{ check_ok, txt }) catch "";
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} MTA-STS: {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} MTA-STS: {s}\n", .{ check_critical, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
             // TLS-RPT
             if (tls_rpt_txt) |txt| {
-                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} TLS-RPT: {s}\n", .{ check_green, txt }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} TLS-RPT: {s}\n", .{ check_ok, txt }) catch "";
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} TLS-RPT: {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} TLS-RPT: {s}\n", .{ check_critical, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
@@ -1116,9 +1116,9 @@ fn writeCheckText(
     max_age: u64,
     exit_code: u8,
 ) !void {
-    const icon_green = neon_yellow ++ "●" ++ reset;
-    const icon_yellow = warn_yellow ++ "●" ++ reset;
-    const icon_red = fail_red ++ "●" ++ reset;
+    const icon_ok = neon_yellow ++ "●" ++ reset;
+    const icon_warning = warn_yellow ++ "●" ++ reset;
+    const icon_critical = fail_red ++ "●" ++ reset;
     const fail_mark = fail_red ++ "✗" ++ reset;
     const warn_mark = warn_yellow ++ "△" ++ reset;
 
@@ -1126,7 +1126,7 @@ fn writeCheckText(
 
     // Status line with colored icon
     const status = if (exit_code == 0) "OK" else if (exit_code == 1) "WARNING" else "CRITICAL";
-    const icon = if (exit_code == 0) icon_green else if (exit_code == 1) icon_yellow else icon_red;
+    const icon = if (exit_code == 0) icon_ok else if (exit_code == 1) icon_warning else icon_critical;
     stdout_file.writeAll(" ") catch {};
     stdout_file.writeAll(icon) catch {};
     const status_msg = std.fmt.bufPrint(&buf, " {s}: DMARC {d}/{d} messages failed ({d}%), TLS-RPT {d} failures\n", .{
