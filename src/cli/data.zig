@@ -1,7 +1,5 @@
 const std = @import("std");
 const reports = @import("reports");
-const ui = @import("ui.zig");
-
 const Config = reports.config.Config;
 const Store = reports.store.Store;
 
