@@ -286,15 +286,19 @@ pub fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: 
             dmarc_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
         }
 
-        // SPF
+        // SPF — search all TXT records since DNS response order is not guaranteed
         {
-            if (reports.ipinfo.queryTxt(allocator, domain)) |txt| {
-                if (std.mem.indexOf(u8, txt, "v=spf1") != null) {
-                    spf_txt = txt;
-                } else {
-                    allocator.free(txt);
+            const all_txt = reports.ipinfo.queryAllTxt(allocator, domain) catch null;
+            if (all_txt) |records| {
+                defer allocator.free(records);
+                for (records) |txt| {
+                    if (std.mem.indexOf(u8, txt, "v=spf1") != null) {
+                        spf_txt = txt;
+                    } else {
+                        allocator.free(txt);
+                    }
                 }
-            } else |_| {}
+            }
         }
 
         // DKIM
