@@ -12,6 +12,8 @@ const logo_text = @embedFile("assets/logo.txt");
 const desc_text = @embedFile("assets/desc.txt");
 
 const neon_yellow = "\x1b[38;2;194;255;38m";
+const warn_yellow = "\x1b[38;2;255;200;0m";
+const fail_red = "\x1b[38;2;255;51;102m";
 const dim = "\x1b[2m";
 const reset = "\x1b[0m";
 
@@ -333,13 +335,13 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
 
     const is_json = std.mem.eql(u8, format, "json");
 
-    const icon_green = "\x1b[38;2;194;255;38m●\x1b[0m";
-    const icon_yellow = "\x1b[38;2;255;200;0m●\x1b[0m";
-    const icon_red = "\x1b[38;2;255;51;102m●\x1b[0m";
-    const check_green = "\x1b[38;2;194;255;38m✓\x1b[0m ";
-    const check_yellow = "\x1b[38;2;255;200;0m△\x1b[0m ";
-    const check_red = "\x1b[38;2;255;51;102m✗\x1b[0m ";
-    const not_found = "\x1b[2m(not found)\x1b[0m";
+    const icon_green = neon_yellow ++ "●" ++ reset;
+    const icon_yellow = warn_yellow ++ "●" ++ reset;
+    const icon_red = fail_red ++ "●" ++ reset;
+    const check_green = neon_yellow ++ "✓" ++ reset ++ " ";
+    const check_yellow = warn_yellow ++ "△" ++ reset ++ " ";
+    const check_red = fail_red ++ "✗" ++ reset ++ " ";
+    const not_found = dim ++ "(not found)" ++ reset;
 
     var json_buf: std.ArrayList(u8) = .empty;
     defer json_buf.deinit(allocator);
@@ -656,7 +658,6 @@ fn cmdSummaryTotal(allocator: std.mem.Allocator, cfg: *const Config, filtered: [
     var stats: PeriodStats = .{};
 
     for (filtered) |entry| {
-
         const st = Store.init(allocator, cfg.data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
@@ -1116,10 +1117,10 @@ fn writeCheckText(
     exit_code: u8,
 ) !void {
     const icon_green = neon_yellow ++ "●" ++ reset;
-    const icon_yellow = "\x1b[38;2;255;200;0m●" ++ reset;
-    const icon_red = "\x1b[38;2;255;51;102m●" ++ reset;
-    const fail_mark = "\x1b[38;2;255;51;102m✗" ++ reset;
-    const warn_mark = "\x1b[38;2;255;200;0m△" ++ reset;
+    const icon_yellow = warn_yellow ++ "●" ++ reset;
+    const icon_red = fail_red ++ "●" ++ reset;
+    const fail_mark = fail_red ++ "✗" ++ reset;
+    const warn_mark = warn_yellow ++ "△" ++ reset;
 
     var buf: [512]u8 = undefined;
 
@@ -1496,7 +1497,7 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool, 
         }
     }
 
-    const icon = if (has_problems) "\x1b[38;2;255;51;102m●" ++ reset else neon_yellow ++ "●" ++ reset;
+    const icon = if (has_problems) fail_red ++ "●" ++ reset else neon_yellow ++ "●" ++ reset;
     stdout_file.writeAll(" ") catch {};
     stdout_file.writeAll(icon) catch {};
     stdout_file.writeAll(" ") catch {};
@@ -1681,7 +1682,7 @@ const ColSpec = struct {
 
 fn evalColor(val: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, val, "pass")) return neon_yellow;
-    if (std.mem.eql(u8, val, "fail")) return "\x1b[38;2;255;51;102m";
+    if (std.mem.eql(u8, val, "fail")) return fail_red;
     return null;
 }
 
@@ -1859,7 +1860,7 @@ fn showTlsTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool, ha
         }
     }
 
-    const icon = if (has_problems) "\x1b[38;2;255;51;102m●" ++ reset else neon_yellow ++ "●" ++ reset;
+    const icon = if (has_problems) fail_red ++ "●" ++ reset else neon_yellow ++ "●" ++ reset;
     stdout_file.writeAll(" ") catch {};
     stdout_file.writeAll(icon) catch {};
     stdout_file.writeAll(" ") catch {};
@@ -2223,7 +2224,7 @@ test "evalColor returns green for pass" {
 test "evalColor returns red for fail" {
     const color = evalColor("fail");
     try std.testing.expect(color != null);
-    try std.testing.expectEqualStrings("\x1b[38;2;255;51;102m", color.?);
+    try std.testing.expectEqualStrings(fail_red, color.?);
 }
 
 test "evalColor returns null for other values" {
