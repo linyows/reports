@@ -921,8 +921,8 @@ fn writeCheckText(
         for (dmarc_fails[0..limit]) |f| {
             var lbuf: [256]u8 = undefined;
             const line = std.fmt.bufPrint(&lbuf, ui.detail_prefix ++ "   {s:<18} {d:>6} {s:<6} {s:<6} {s:<20} {s}\n", .{
-                ui.truncate(f.source_ip, 18), f.count, ui.truncate(f.dkim, 6), ui.truncate(f.spf, 6),
-                ui.truncate(f.domain, 20), ui.truncate(f.org, 20),
+                ui.truncate(f.source_ip, 18), f.count,                ui.truncate(f.dkim, 6), ui.truncate(f.spf, 6),
+                ui.truncate(f.domain, 20),    ui.truncate(f.org, 20),
             }) catch continue;
             ui.stdout_file.writeAll(line) catch {};
         }
