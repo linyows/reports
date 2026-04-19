@@ -273,7 +273,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
 
     {
         var buf: [128]u8 = undefined;
-        const found_msg = std.fmt.bufPrint(&buf, detail_prefix ++ "Found {d} messages ({d} new)\n", .{ uids.len, new_uid_slice.len }) catch "";
+        const found_msg = std.fmt.bufPrint(&buf, detail_prefix ++ "Found {d} messages ({d} new)\n", .{ uids.len, new_uid_slice.len }) catch detail_prefix ++ "Found messages\n";
         stdout_file.writeAll(found_msg) catch {};
     }
 
