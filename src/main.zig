@@ -15,6 +15,10 @@ const neon_yellow = "\x1b[38;2;194;255;38m";
 const dim = "\x1b[2m";
 const reset = "\x1b[0m";
 
+const section_prefix = " " ++ neon_yellow ++ "●" ++ reset ++ " ";
+const branch_prefix = "   " ++ dim ++ "⎿" ++ reset ++ "  ";
+const detail_prefix = "      ";
+
 pub fn main() !void {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
@@ -39,7 +43,9 @@ pub fn main() !void {
     if (std.mem.eql(u8, command, "sync")) {
         const refetch = hasFlag(args, "--refetch");
         try cmdFetch(allocator, account, refetch);
+        stdout_file.writeAll("\n") catch {};
         try cmdEnrich(allocator);
+        stdout_file.writeAll("\n") catch {};
         try cmdAggregate(allocator);
     } else if (std.mem.eql(u8, command, "fetch")) {
         const refetch = hasFlag(args, "--refetch");
@@ -49,19 +55,19 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "aggregate")) {
         try cmdAggregate(allocator);
     } else if (std.mem.eql(u8, command, "list")) {
-        try cmdList(allocator, format orelse "table", domain, account, report_type);
+        try cmdList(allocator, format orelse "text", domain, account, report_type);
     } else if (std.mem.eql(u8, command, "show")) {
         if (args.len < 3 or std.mem.startsWith(u8, args[2], "--")) {
             stderr_file.writeAll("Usage: reports show <report-id>\n") catch {};
             return;
         }
-        try cmdShow(allocator, args[2], format orelse "table", enrich);
+        try cmdShow(allocator, args[2], format orelse "text", enrich);
     } else if (std.mem.eql(u8, command, "dns")) {
         try cmdDns(allocator, domain, format orelse "text");
     } else if (std.mem.eql(u8, command, "domains")) {
-        try cmdDomains(allocator, format orelse "table", account);
+        try cmdDomains(allocator, format orelse "text", account);
     } else if (std.mem.eql(u8, command, "summary")) {
-        try cmdSummary(allocator, format orelse "json", domain, account, period);
+        try cmdSummary(allocator, format orelse "text", domain, account, period);
     } else if (std.mem.eql(u8, command, "check")) {
         const threshold = getOption(args, "--threshold");
         const max_age = getOption(args, "--max-age");
@@ -94,6 +100,8 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, refetch: 
     reports.imap.globalInit();
     defer reports.imap.globalCleanup();
 
+    stdout_file.writeAll(section_prefix ++ "Messages Fetch\n") catch {};
+
     for (cfg.accounts) |acct| {
         if (account_filter) |filter| {
             if (!std.mem.eql(u8, acct.name, filter)) continue;
@@ -103,14 +111,14 @@ fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, refetch: 
 
         {
             var buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "\nAccount: {s}\n", .{acct.name}) catch "";
+            const msg = std.fmt.bufPrint(&buf, branch_prefix ++ "{s}\n", .{acct.name}) catch "";
             stdout_file.writeAll(msg) catch {};
         }
 
         const result = fetchForAccount(allocator, &acct, cfg.data_dir, refetch);
 
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "Fetched {d} DMARC and {d} TLS-RPT reports.\n", .{
+        const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "Fetched {d} DMARC and {d} TLS-RPT reports\n", .{
             result.dmarc, result.tls,
         }) catch "Done.\n";
         stdout_file.writeAll(msg) catch {};
@@ -145,10 +153,12 @@ fn cmdAggregate(allocator: std.mem.Allocator) !void {
         std.fs.deleteFileAbsolute(path) catch {};
     }
 
+    stdout_file.writeAll(section_prefix ++ "Reports Aggregation\n") catch {};
+    stdout_file.writeAll(branch_prefix ++ "Aggregating...\n") catch {};
     var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "\nAggregated: {d} unique IPs, {d} reports. Caches invalidated.\n", .{
-        ips.len, entries.len,
-    }) catch "\nAggregation complete.\n";
+    const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "Aggregated {d} reports\n", .{
+        entries.len,
+    }) catch detail_prefix ++ "Aggregation complete\n";
     stdout_file.writeAll(msg) catch {};
 }
 
@@ -159,7 +169,11 @@ fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
     const ips = try reports.fetch.collectSourceIps(allocator, cfg.data_dir, names);
     defer reports.fetch.freeIpList(allocator, ips);
 
-    if (ips.len == 0) return;
+    if (ips.len == 0) {
+        stdout_file.writeAll(section_prefix ++ "IP Enrichment\n") catch {};
+        stdout_file.writeAll(branch_prefix ++ "No IPs to enrich\n") catch {};
+        return;
+    }
 
     var cache = try reports.enrichcache.Cache.init(allocator, cfg.data_dir);
     defer cache.deinit();
@@ -170,15 +184,21 @@ fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
         if (!cache.hasFresh(ip)) pending += 1;
     }
 
+    stdout_file.writeAll(section_prefix ++ "IP Enrichment\n") catch {};
     {
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "\nEnriching {d} IPs ({d} cached, {d} new)...\n", .{
-            ips.len, ips.len - pending, pending,
-        }) catch "\nEnriching IPs...\n";
+        const msg = std.fmt.bufPrint(&buf, branch_prefix ++ "Enriching ({d} cached, {d} new)...\n", .{
+            ips.len - pending, pending,
+        }) catch branch_prefix ++ "Enriching IPs...\n";
         stdout_file.writeAll(msg) catch {};
     }
 
-    if (pending == 0) return;
+    if (pending == 0) {
+        var ebuf: [128]u8 = undefined;
+        const emsg = std.fmt.bufPrint(&ebuf, detail_prefix ++ "Enriched {d} IPs\n", .{ips.len}) catch detail_prefix ++ "Enrichment complete\n";
+        stdout_file.writeAll(emsg) catch {};
+        return;
+    }
 
     var progress = std.atomic.Value(usize).init(0);
 
@@ -195,13 +215,17 @@ fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
 
     while (progress.load(.monotonic) < ips.len) {
         var pbuf: [64]u8 = undefined;
-        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]", .{ progress.load(.monotonic), ips.len }) catch "";
+        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K" ++ detail_prefix ++ "[{d}/{d}]", .{ progress.load(.monotonic), ips.len }) catch "";
         stderr_file.writeAll(prog) catch {};
         std.Thread.sleep(200 * std.time.ns_per_ms);
     }
     thread.join();
     stderr_file.writeAll("\r\x1b[K") catch {};
-    stdout_file.writeAll("Enrichment complete.\n") catch {};
+    {
+        var ebuf: [128]u8 = undefined;
+        const emsg = std.fmt.bufPrint(&ebuf, detail_prefix ++ "Enriched {d} IPs\n", .{ips.len}) catch detail_prefix ++ "Enrichment complete\n";
+        stdout_file.writeAll(emsg) catch {};
+    }
 }
 
 fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8, refetch: bool) struct { dmarc: u32, tls: u32 } {
@@ -228,7 +252,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
     defer fetched_set.deinit();
 
-    stdout_file.writeAll("Searching for report messages...\n") catch {};
+    stdout_file.writeAll(detail_prefix ++ "Searching for report messages...\n") catch {};
     const uids = client.searchReports() catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "IMAP search failed: {s}\n", .{@errorName(err)}) catch "IMAP search failed\n";
@@ -247,7 +271,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
 
     {
         var buf: [128]u8 = undefined;
-        const found_msg = std.fmt.bufPrint(&buf, "Found {d} messages ({d} new). Fetching...\n", .{ uids.len, new_uid_slice.len }) catch "Fetching...\n";
+        const found_msg = std.fmt.bufPrint(&buf, detail_prefix ++ "Found {d} messages ({d} new)\n", .{ uids.len, new_uid_slice.len }) catch "";
         stdout_file.writeAll(found_msg) catch {};
     }
 
@@ -262,7 +286,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     while (progress.load(.monotonic) < new_uid_slice.len) {
         {
             var pbuf: [64]u8 = undefined;
-            const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
+            const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K" ++ detail_prefix ++ "[{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
             stderr_file.writeAll(prog) catch {};
         }
         std.Thread.sleep(200 * std.time.ns_per_ms);
@@ -270,7 +294,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     job.join();
     {
         var pbuf: [64]u8 = undefined;
-        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K  [{d}/{d}]\n", .{ new_uid_slice.len, new_uid_slice.len }) catch "\n";
+        const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K" ++ detail_prefix ++ "[{d}/{d}]\n", .{ new_uid_slice.len, new_uid_slice.len }) catch "\n";
         stderr_file.writeAll(prog) catch {};
     }
 
@@ -428,49 +452,49 @@ fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []co
             // DMARC
             if (dmarc_txt) |txt| {
                 const ci = if (dmarc_policy_weak) check_yellow else check_green;
-                const msg = std.fmt.bufPrint(&buf, "   {s} DMARC:   {s}\n", .{ ci, txt }) catch "";
+                const msg = std.fmt.bufPrint(&buf, branch_prefix ++ "{s} DMARC:   {s}\n", .{ ci, txt }) catch "";
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, "   {s} DMARC:   {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, branch_prefix ++ "{s} DMARC:   {s}\n", .{ check_red, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
             // SPF
             if (spf_txt) |txt| {
                 const ci = if (spf_weak) check_yellow else check_green;
-                const msg = std.fmt.bufPrint(&buf, "   {s} SPF:     {s}\n", .{ ci, txt }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} SPF:     {s}\n", .{ ci, txt }) catch "";
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, "   {s} SPF:     {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} SPF:     {s}\n", .{ check_red, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
             // DKIM
             if (dkim_txt) |txt| {
                 const trunc = if (txt.len > 60) txt[0..60] else txt;
-                const msg = std.fmt.allocPrint(allocator, "   {s} DKIM:    {s}... ({s}._domainkey)\n", .{ check_green, trunc, dkim_selector }) catch continue;
+                const msg = std.fmt.allocPrint(allocator, detail_prefix ++ "{s} DKIM:    {s}... ({s}._domainkey)\n", .{ check_green, trunc, dkim_selector }) catch continue;
                 defer allocator.free(msg);
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, "   {s} DKIM:    {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} DKIM:    {s}\n", .{ check_red, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
             // MTA-STS
             if (mta_sts_txt) |txt| {
-                const msg = std.fmt.bufPrint(&buf, "   {s} MTA-STS: {s}\n", .{ check_green, txt }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} MTA-STS: {s}\n", .{ check_green, txt }) catch "";
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, "   {s} MTA-STS: {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} MTA-STS: {s}\n", .{ check_red, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
             // TLS-RPT
             if (tls_rpt_txt) |txt| {
-                const msg = std.fmt.bufPrint(&buf, "   {s} TLS-RPT: {s}\n", .{ check_green, txt }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} TLS-RPT: {s}\n", .{ check_green, txt }) catch "";
                 stdout_file.writeAll(msg) catch {};
             } else {
-                const msg = std.fmt.bufPrint(&buf, "   {s} TLS-RPT: {s}\n", .{ check_red, not_found }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "{s} TLS-RPT: {s}\n", .{ check_red, not_found }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
 
@@ -575,7 +599,7 @@ fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const 
                         stdout_file.writeAll(data) catch {};
                         stdout_file.writeAll("\n") catch {};
                     } else {
-                        try showDmarcTable(allocator, data, enrich);
+                        try showDmarcTable(allocator, data, enrich, hash_id);
                     }
                 },
                 .tlsrpt => {
@@ -586,7 +610,7 @@ fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const 
                         stdout_file.writeAll(data) catch {};
                         stdout_file.writeAll("\n") catch {};
                     } else {
-                        try showTlsTable(allocator, data, enrich);
+                        try showTlsTable(allocator, data, enrich, hash_id);
                     }
                 },
             }
@@ -632,6 +656,7 @@ fn cmdSummaryTotal(allocator: std.mem.Allocator, cfg: *const Config, filtered: [
     var stats: PeriodStats = .{};
 
     for (filtered) |entry| {
+
         const st = Store.init(allocator, cfg.data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
@@ -649,22 +674,25 @@ fn cmdSummaryTotal(allocator: std.mem.Allocator, cfg: *const Config, filtered: [
     var buf: [512]u8 = undefined;
     if (std.mem.eql(u8, format, "json")) {
         const msg = std.fmt.bufPrint(&buf,
-            \\{{"dmarc_reports":{d},"tlsrpt_reports":{d},"total_messages":{d},"dkim_spf_pass":{d},"dkim_spf_fail":{d}}}
+            \\{{"dmarc_reports":{d},"tlsrpt_reports":{d},"messages_evaluated":{d},"dkim_spf_pass":{d},"dkim_spf_fail":{d}}}
             \\
         , .{ stats.dmarc, stats.tlsrpt, stats.messages, stats.pass, stats.fail }) catch return;
         stdout_file.writeAll(msg) catch {};
     } else {
-        const labels = [_]struct { label: []const u8, value: u64 }{
-            .{ .label = "DMARC Reports:    ", .value = stats.dmarc },
-            .{ .label = "TLS-RPT Reports:  ", .value = stats.tlsrpt },
-            .{ .label = "Total Messages:   ", .value = stats.messages },
-            .{ .label = "DKIM/SPF Pass:    ", .value = stats.pass },
-            .{ .label = "DKIM/SPF Fail:    ", .value = stats.fail },
-        };
-        for (labels) |entry| {
-            const msg = std.fmt.bufPrint(&buf, "{s}{d}\n", .{ entry.label, entry.value }) catch continue;
-            stdout_file.writeAll(msg) catch {};
-        }
+        stdout_file.writeAll(dim) catch {};
+        const header = std.fmt.bufPrint(&buf, "{s:<12} {s:>6} {s:>8} {s:>10} {s:>8} {s:>8}\n", .{
+            "PERIOD", "DMARC", "TLS-RPT", "MESSAGES", "PASS", "FAIL",
+        }) catch return;
+        stdout_file.writeAll(header) catch {};
+        const sep = std.fmt.bufPrint(&buf, "{s:-<12} {s:->6} {s:->8} {s:->10} {s:->8} {s:->8}\n", .{
+            "", "", "", "", "", "",
+        }) catch return;
+        stdout_file.writeAll(sep) catch {};
+        stdout_file.writeAll(reset) catch {};
+        const line = std.fmt.bufPrint(&buf, "{s:<12} {d:>6} {d:>8} {d:>10} {d:>8} {d:>8}\n", .{
+            "All", stats.dmarc, stats.tlsrpt, stats.messages, stats.pass, stats.fail,
+        }) catch return;
+        stdout_file.writeAll(line) catch {};
     }
 }
 
@@ -803,7 +831,7 @@ fn writePeriodJson(allocator: std.mem.Allocator, keys: []const []const u8, map: 
         const s = map.get(key) orelse continue;
         const line = try std.fmt.allocPrint(allocator,
             \\
-            \\  {{"period":"{s}","dmarc_reports":{d},"tlsrpt_reports":{d},"total_messages":{d},"dkim_spf_pass":{d},"dkim_spf_fail":{d}}}
+            \\  {{"period":"{s}","dmarc_reports":{d},"tlsrpt_reports":{d},"messages_evaluated":{d},"dkim_spf_pass":{d},"dkim_spf_fail":{d}}}
         , .{ key, s.dmarc, s.tlsrpt, s.messages, s.pass, s.fail });
         defer allocator.free(line);
         stdout_file.writeAll(line) catch {};
@@ -813,6 +841,7 @@ fn writePeriodJson(allocator: std.mem.Allocator, keys: []const []const u8, map: 
 
 fn writePeriodTable(keys: []const []const u8, map: *const std.StringHashMap(PeriodStats)) !void {
     var buf: [512]u8 = undefined;
+    stdout_file.writeAll(dim) catch {};
     const header = std.fmt.bufPrint(&buf, "{s:<12} {s:>6} {s:>8} {s:>10} {s:>8} {s:>8}\n", .{
         "PERIOD", "DMARC", "TLS-RPT", "MESSAGES", "PASS", "FAIL",
     }) catch return;
@@ -822,6 +851,7 @@ fn writePeriodTable(keys: []const []const u8, map: *const std.StringHashMap(Peri
         "", "", "", "", "", "",
     }) catch return;
     stdout_file.writeAll(sep) catch {};
+    stdout_file.writeAll(reset) catch {};
 
     for (keys) |key| {
         const s = map.get(key) orelse continue;
@@ -1063,6 +1093,19 @@ fn epochDays(year: u16, month: u8, day: u8) i64 {
     return era_days;
 }
 
+fn formatEpoch(buf: *[20]u8, ts: i64) []const u8 {
+    if (ts == 0) return "";
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        year_day.year, month_day.month.numeric(), month_day.day_index + 1,
+        day_secs.getHoursIntoDay(), day_secs.getMinutesIntoHour(), day_secs.getSecondsIntoMinute(),
+    }) catch "";
+}
+
 fn writeCheckText(
     result: *const CheckResult,
     dmarc_fails: []const CheckDmarcFailRecord,
@@ -1072,18 +1115,27 @@ fn writeCheckText(
     max_age: u64,
     exit_code: u8,
 ) !void {
+    const icon_green = neon_yellow ++ "●" ++ reset;
+    const icon_yellow = "\x1b[38;2;255;200;0m●" ++ reset;
+    const icon_red = "\x1b[38;2;255;51;102m●" ++ reset;
+    const fail_mark = "\x1b[38;2;255;51;102m✗" ++ reset;
+    const warn_mark = "\x1b[38;2;255;200;0m△" ++ reset;
+
     var buf: [512]u8 = undefined;
 
-    // Status line
+    // Status line with colored icon
     const status = if (exit_code == 0) "OK" else if (exit_code == 1) "WARNING" else "CRITICAL";
-    const status_msg = std.fmt.bufPrint(&buf, "{s}: DMARC {d}/{d} messages failed ({d}%), TLS-RPT {d} failures\n", .{
+    const icon = if (exit_code == 0) icon_green else if (exit_code == 1) icon_yellow else icon_red;
+    stdout_file.writeAll(" ") catch {};
+    stdout_file.writeAll(icon) catch {};
+    const status_msg = std.fmt.bufPrint(&buf, " {s}: DMARC {d}/{d} messages failed ({d}%), TLS-RPT {d} failures\n", .{
         status, result.dmarc_fail, result.dmarc_total, dmarc_fail_rate, result.tls_total_failure,
     }) catch "";
     stdout_file.writeAll(status_msg) catch {};
 
-    // Failure pattern breakdown
+    // Auth mechanism breakdown
     if (result.dkim_only_fail > 0 or result.spf_only_fail > 0 or result.both_fail > 0) {
-        stdout_file.writeAll("\nAuth mechanism breakdown (single-mechanism fails still pass DMARC):\n") catch {};
+        stdout_file.writeAll(branch_prefix ++ fail_mark ++ "  Auth mechanism breakdown (single-mechanism fails still pass DMARC)\n") catch {};
         const breakdown = [_]struct { ft: reports.stats.FailureType, count: u64 }{
             .{ .ft = .both_fail, .count = result.both_fail },
             .{ .ft = .dkim_only_fail, .count = result.dkim_only_fail },
@@ -1091,14 +1143,16 @@ fn writeCheckText(
         };
         for (breakdown) |b| {
             if (b.count > 0) {
-                const msg = std.fmt.bufPrint(&buf, "  {s}: {d} messages ({s})\n", .{ b.ft.label(), b.count, b.ft.hint() }) catch "";
+                const msg = std.fmt.bufPrint(&buf, detail_prefix ++ "   {s}: {d} messages ({s})\n", .{ b.ft.label(), b.count, b.ft.hint() }) catch "";
                 stdout_file.writeAll(msg) catch {};
             }
         }
     }
 
     if (stale) {
-        const stale_msg = std.fmt.bufPrint(&buf, "WARNING: No reports received in the last {d} days (latest: {s})\n", .{
+        stdout_file.writeAll("\n") catch {};
+        stdout_file.writeAll(branch_prefix ++ warn_mark) catch {};
+        const stale_msg = std.fmt.bufPrint(&buf, "  No reports received in the last {d} days (latest: {s})\n", .{
             max_age, if (result.latest_date.len > 0) result.latest_date else "none",
         }) catch "";
         stdout_file.writeAll(stale_msg) catch {};
@@ -1106,44 +1160,48 @@ fn writeCheckText(
 
     // DMARC failures summary
     if (dmarc_fails.len > 0) {
-        const hdr = std.fmt.bufPrint(&buf, "\nDMARC failures ({d} records):\n", .{dmarc_fails.len}) catch "";
+        stdout_file.writeAll("\n") catch {};
+        stdout_file.writeAll(branch_prefix ++ fail_mark) catch {};
+        const hdr = std.fmt.bufPrint(&buf, "  DMARC failures ({d} records)\n", .{dmarc_fails.len}) catch "";
         stdout_file.writeAll(hdr) catch {};
-        stdout_file.writeAll("  SOURCE IP          COUNT  DKIM   SPF    DOMAIN               ORG\n") catch {};
-        stdout_file.writeAll("  ------------------ ------ ------ ------ -------------------- --------------------\n") catch {};
+        stdout_file.writeAll(detail_prefix ++ "   " ++ dim ++ "SOURCE IP          COUNT  DKIM   SPF    DOMAIN               ORG" ++ reset ++ "\n") catch {};
+        stdout_file.writeAll(detail_prefix ++ "   " ++ dim ++ "------------------ ------ ------ ------ -------------------- --------------------" ++ reset ++ "\n") catch {};
 
         const limit = @min(dmarc_fails.len, 20);
         for (dmarc_fails[0..limit]) |f| {
             var lbuf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&lbuf, "  {s:<18} {d:>6} {s:<6} {s:<6} {s:<20} {s}\n", .{
-                truncate(f.source_ip, 18), f.count,             truncate(f.dkim, 6), truncate(f.spf, 6),
-                truncate(f.domain, 20),    truncate(f.org, 20),
+            const line = std.fmt.bufPrint(&lbuf, detail_prefix ++ "   {s:<18} {d:>6} {s:<6} {s:<6} {s:<20} {s}\n", .{
+                truncate(f.source_ip, 18), f.count, truncate(f.dkim, 6), truncate(f.spf, 6),
+                truncate(f.domain, 20), truncate(f.org, 20),
             }) catch continue;
             stdout_file.writeAll(line) catch {};
         }
         if (dmarc_fails.len > 20) {
-            const more = std.fmt.bufPrint(&buf, "  ... and {d} more\n", .{dmarc_fails.len - 20}) catch "";
+            const more = std.fmt.bufPrint(&buf, detail_prefix ++ "   " ++ dim ++ "... and {d} more" ++ reset ++ "\n", .{dmarc_fails.len - 20}) catch "";
             stdout_file.writeAll(more) catch {};
         }
     }
 
     // TLS failures summary
     if (tls_fails.len > 0) {
-        const hdr = std.fmt.bufPrint(&buf, "\nTLS-RPT failures ({d} records):\n", .{tls_fails.len}) catch "";
+        stdout_file.writeAll("\n") catch {};
+        stdout_file.writeAll(branch_prefix ++ fail_mark) catch {};
+        const hdr = std.fmt.bufPrint(&buf, "  TLS-RPT failures ({d} records)\n", .{tls_fails.len}) catch "";
         stdout_file.writeAll(hdr) catch {};
-        stdout_file.writeAll("  RESULT TYPE                  COUNT  RECEIVING MX                 DOMAIN\n") catch {};
-        stdout_file.writeAll("  ---------------------------- ------ ---------------------------- --------------------\n") catch {};
+        stdout_file.writeAll(detail_prefix ++ "   " ++ dim ++ "RESULT TYPE                  COUNT  RECEIVING MX                 DOMAIN" ++ reset ++ "\n") catch {};
+        stdout_file.writeAll(detail_prefix ++ "   " ++ dim ++ "---------------------------- ------ ---------------------------- --------------------" ++ reset ++ "\n") catch {};
 
         const limit = @min(tls_fails.len, 20);
         for (tls_fails[0..limit]) |f| {
             var lbuf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&lbuf, "  {s:<28} {d:>6} {s:<28} {s}\n", .{
+            const line = std.fmt.bufPrint(&lbuf, detail_prefix ++ "   {s:<28} {d:>6} {s:<28} {s}\n", .{
                 truncate(f.result_type, 28), f.failed_count, truncate(f.receiving_mx, 28),
                 truncate(f.domain, 20),
             }) catch continue;
             stdout_file.writeAll(line) catch {};
         }
         if (tls_fails.len > 20) {
-            const more = std.fmt.bufPrint(&buf, "  ... and {d} more\n", .{tls_fails.len - 20}) catch "";
+            const more = std.fmt.bufPrint(&buf, detail_prefix ++ "   " ++ dim ++ "... and {d} more" ++ reset ++ "\n", .{tls_fails.len - 20}) catch "";
             stdout_file.writeAll(more) catch {};
         }
     }
@@ -1341,6 +1399,7 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
     w_org += 1;
     w_policy += 1;
 
+    stdout_file.writeAll(dim) catch {};
     try writeTableRow(allocator, &.{
         .{ .val = "ID", .width = w_id },
         .{ .val = "ACCOUNT", .width = w_acct },
@@ -1351,6 +1410,7 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
         .{ .val = "POLICY", .width = w_policy },
     });
     try writeSepRow(allocator, &.{ w_id, w_acct, w_type, w_date, w_domain, w_org, w_policy });
+    stdout_file.writeAll(reset) catch {};
 
     for (entries) |e| {
         const type_str: []const u8 = switch (e.report_type) {
@@ -1418,22 +1478,52 @@ const RowData = struct {
     flag: []const u8,
 };
 
-fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
+fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool, hash_id: []const u8) !void {
     const parsed = try std.json.parseFromSlice(DmarcDetailJson, allocator, data, .{
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
     const r = parsed.value;
 
-    for ([_]struct { label: []const u8, value: []const u8 }{
-        .{ .label = "Organization: ", .value = r.metadata.org_name },
+    // Check if any record has problems (both DKIM and SPF fail)
+    var has_problems = false;
+    for (r.records) |rec| {
+        const dkim_pass = std.mem.eql(u8, rec.dkim_eval, "pass");
+        const spf_pass = std.mem.eql(u8, rec.spf_eval, "pass");
+        if (!dkim_pass and !spf_pass) {
+            has_problems = true;
+            break;
+        }
+    }
+
+    const icon = if (has_problems) "\x1b[38;2;255;51;102m●" ++ reset else neon_yellow ++ "●" ++ reset;
+    stdout_file.writeAll(" ") catch {};
+    stdout_file.writeAll(icon) catch {};
+    stdout_file.writeAll(" ") catch {};
+    stdout_file.writeAll(hash_id) catch {};
+    stdout_file.writeAll("\n") catch {};
+
+    // Format timestamps
+    var begin_buf: [20]u8 = undefined;
+    var end_buf: [20]u8 = undefined;
+    const begin_str = formatEpoch(&begin_buf, r.metadata.date_begin);
+    const end_str = formatEpoch(&end_buf, r.metadata.date_end);
+
+    var buf: [256]u8 = undefined;
+    stdout_file.writeAll(branch_prefix) catch {};
+    const org_line = std.fmt.bufPrint(&buf, "Organization: {s}\n", .{r.metadata.org_name}) catch "";
+    stdout_file.writeAll(org_line) catch {};
+
+    const meta_items = [_]struct { label: []const u8, value: []const u8 }{
         .{ .label = "Report ID:    ", .value = r.metadata.report_id },
         .{ .label = "Domain:       ", .value = r.policy.domain },
         .{ .label = "Policy:       ", .value = r.policy.policy },
-    }) |item| {
-        stdout_file.writeAll(item.label) catch {};
-        stdout_file.writeAll(item.value) catch {};
-        stdout_file.writeAll("\n") catch {};
+        .{ .label = "Begin:        ", .value = begin_str },
+        .{ .label = "End:          ", .value = end_str },
+    };
+    for (meta_items) |item| {
+        const line = std.fmt.bufPrint(&buf, detail_prefix ++ "{s}{s}\n", .{ item.label, item.value }) catch continue;
+        stdout_file.writeAll(line) catch {};
     }
     stdout_file.writeAll("\n") catch {};
 
@@ -1526,6 +1616,7 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
     const w_dkim: usize = 5;
     const w_spf: usize = 5;
 
+    stdout_file.writeAll(dim) catch {};
     if (enrich) {
         try writeTableRow(allocator, &.{
             .{ .val = "SOURCE IP", .width = w_ip },
@@ -1550,6 +1641,7 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
         });
         try writeSepRow(allocator, &.{ w_ip, w_count, w_disp, w_from, w_dkim, w_spf });
     }
+    stdout_file.writeAll(reset) catch {};
 
     for (rows.items) |row| {
         var count_buf: [16]u8 = undefined;
@@ -1564,8 +1656,8 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
                 .{ .val = count_str, .width = w_count },
                 .{ .val = row.disposition, .width = w_disp },
                 .{ .val = row.from, .width = w_from },
-                .{ .val = row.dkim_eval, .width = w_dkim },
-                .{ .val = row.spf_eval, .width = w_spf },
+                .{ .val = row.dkim_eval, .width = w_dkim, .color = evalColor(row.dkim_eval) },
+                .{ .val = row.spf_eval, .width = w_spf, .color = evalColor(row.spf_eval) },
             });
         } else {
             try writeTableRow(allocator, &.{
@@ -1573,8 +1665,8 @@ fn showDmarcTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) 
                 .{ .val = count_str, .width = w_count },
                 .{ .val = row.disposition, .width = w_disp },
                 .{ .val = row.from, .width = w_from },
-                .{ .val = row.dkim_eval, .width = w_dkim },
-                .{ .val = row.spf_eval, .width = w_spf },
+                .{ .val = row.dkim_eval, .width = w_dkim, .color = evalColor(row.dkim_eval) },
+                .{ .val = row.spf_eval, .width = w_spf, .color = evalColor(row.spf_eval) },
             });
         }
     }
@@ -1584,7 +1676,14 @@ const ColSpec = struct {
     val: []const u8,
     width: usize,
     is_emoji: bool = false,
+    color: ?[]const u8 = null,
 };
+
+fn evalColor(val: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, val, "pass")) return neon_yellow;
+    if (std.mem.eql(u8, val, "fail")) return "\x1b[38;2;255;51;102m";
+    return null;
+}
 
 fn writeTableRow(allocator: std.mem.Allocator, cols: []const ColSpec) !void {
     for (cols, 0..) |col, i| {
@@ -1603,7 +1702,9 @@ fn writeTableRow(allocator: std.mem.Allocator, cols: []const ColSpec) !void {
         } else {
             // Normal text: truncate to column width, pad remainder
             const text = truncate(col.val, col.width);
+            if (col.color) |c| stdout_file.writeAll(c) catch {};
             stdout_file.writeAll(text) catch {};
+            if (col.color != null) stdout_file.writeAll(reset) catch {};
             if (text.len < col.width) {
                 const pad = allocator.alloc(u8, col.width - text.len) catch continue;
                 defer allocator.free(pad);
@@ -1742,35 +1843,52 @@ fn countryFlag(allocator: std.mem.Allocator, cc: []const u8) ![]const u8 {
     return try allocator.dupe(u8, result[0 .. len0 + len1]);
 }
 
-fn showTlsTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool) !void {
+fn showTlsTable(allocator: std.mem.Allocator, data: []const u8, enrich: bool, hash_id: []const u8) !void {
     const parsed = try std.json.parseFromSlice(TlsDetailJson, allocator, data, .{
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
     const r = parsed.value;
 
+    // Check if any policy has failures
+    var has_problems = false;
+    for (r.policies) |p| {
+        if (p.total_failure > 0) {
+            has_problems = true;
+            break;
+        }
+    }
+
+    const icon = if (has_problems) "\x1b[38;2;255;51;102m●" ++ reset else neon_yellow ++ "●" ++ reset;
+    stdout_file.writeAll(" ") catch {};
+    stdout_file.writeAll(icon) catch {};
+    stdout_file.writeAll(" ") catch {};
+    stdout_file.writeAll(hash_id) catch {};
+    stdout_file.writeAll("\n") catch {};
+
     var buf: [512]u8 = undefined;
 
-    stdout_file.writeAll("Organization: ") catch {};
-    stdout_file.writeAll(r.organization_name) catch {};
-    stdout_file.writeAll("\nReport ID:    ") catch {};
-    stdout_file.writeAll(r.report_id) catch {};
-    stdout_file.writeAll("\n\n") catch {};
+    stdout_file.writeAll(branch_prefix) catch {};
+    const org_line = std.fmt.bufPrint(&buf, "Organization: {s}\n", .{r.organization_name}) catch "";
+    stdout_file.writeAll(org_line) catch {};
+    const rid_line = std.fmt.bufPrint(&buf, detail_prefix ++ "Report ID:    {s}\n", .{r.report_id}) catch "";
+    stdout_file.writeAll(rid_line) catch {};
+    stdout_file.writeAll("\n") catch {};
 
     for (r.policies) |p| {
-        const policy_line = std.fmt.bufPrint(&buf, "Policy: {s} ({s})\n", .{ p.policy_domain, p.policy_type }) catch continue;
+        const policy_line = std.fmt.bufPrint(&buf, detail_prefix ++ "Policy: {s} ({s})\n", .{ p.policy_domain, p.policy_type }) catch continue;
         stdout_file.writeAll(policy_line) catch {};
 
-        const succ = std.fmt.bufPrint(&buf, "  Successful sessions: {d}\n", .{p.total_successful}) catch continue;
+        const succ = std.fmt.bufPrint(&buf, detail_prefix ++ "  Successful sessions: {d}\n", .{p.total_successful}) catch continue;
         stdout_file.writeAll(succ) catch {};
 
-        const fail = std.fmt.bufPrint(&buf, "  Failed sessions:     {d}\n", .{p.total_failure}) catch continue;
+        const fail = std.fmt.bufPrint(&buf, detail_prefix ++ "  Failed sessions:     {d}\n", .{p.total_failure}) catch continue;
         stdout_file.writeAll(fail) catch {};
 
         if (p.failures.len > 0) {
-            stdout_file.writeAll("\n  Failures:\n") catch {};
+            stdout_file.writeAll("\n" ++ detail_prefix ++ "  Failures:\n") catch {};
             for (p.failures) |f| {
-                const fline = std.fmt.bufPrint(&buf, "    {s}: {s} -> {s} ({d} sessions)\n", .{
+                const fline = std.fmt.bufPrint(&buf, detail_prefix ++ "    {s}: {s} -> {s} ({d} sessions)\n", .{
                     f.result_type, f.sending_mta_ip, f.receiving_mx_hostname, f.failed_session_count,
                 }) catch continue;
                 stdout_file.writeAll(fline) catch {};
@@ -1795,6 +1913,8 @@ const DmarcDetailJson = struct {
     metadata: struct {
         org_name: []const u8 = "",
         report_id: []const u8 = "",
+        date_begin: i64 = 0,
+        date_end: i64 = 0,
     },
     policy: struct {
         domain: []const u8 = "",
@@ -1873,12 +1993,13 @@ fn printUsage() void {
         \\  version                      Show version
         \\  help                         Show this help
         \\
-        \\Options:
+        \\Filters:
         \\  --account <name>      Target specific account (default: all)
-        \\  --format <text|json>  Output format for check (default: text)
-        \\  --format <table|json> Output format (default: table)
         \\  --domain <domain>     Filter by domain
         \\  --type <dmarc|tlsrpt> Filter by report type
+        \\
+        \\Options:
+        \\  --format <text|json>  Output format (default: text)
         \\  --period <week|month|year> Group summary by period
         \\  --threshold <percent> Fail rate threshold for check (default: 0)
         \\  --max-age <days>      Report freshness threshold (default: 7)
@@ -2071,4 +2192,59 @@ test "dateAgeDays returns 0 for today" {
 
 test "dateAgeDays returns error for short date" {
     try std.testing.expectError(error.InvalidDate, dateAgeDays("2020"));
+}
+
+test "formatEpoch returns empty string for zero timestamp" {
+    var buf: [20]u8 = undefined;
+    const result = formatEpoch(&buf, 0);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "formatEpoch formats Unix epoch correctly" {
+    var buf: [20]u8 = undefined;
+    // 2024-01-01 00:00:00 UTC = 1704067200
+    const result = formatEpoch(&buf, 1704067200);
+    try std.testing.expectEqualStrings("2024-01-01 00:00:00", result);
+}
+
+test "formatEpoch formats date with time correctly" {
+    var buf: [20]u8 = undefined;
+    // 2025-06-15 15:30:00 UTC = 1750001400
+    const result = formatEpoch(&buf, 1750001400);
+    try std.testing.expectEqualStrings("2025-06-15 15:30:00", result);
+}
+
+test "evalColor returns green for pass" {
+    const color = evalColor("pass");
+    try std.testing.expect(color != null);
+    try std.testing.expectEqualStrings(neon_yellow, color.?);
+}
+
+test "evalColor returns red for fail" {
+    const color = evalColor("fail");
+    try std.testing.expect(color != null);
+    try std.testing.expectEqualStrings("\x1b[38;2;255;51;102m", color.?);
+}
+
+test "evalColor returns null for other values" {
+    try std.testing.expect(evalColor("none") == null);
+    try std.testing.expect(evalColor("") == null);
+    try std.testing.expect(evalColor("softfail") == null);
+}
+
+test "section_prefix contains colored bullet" {
+    try std.testing.expect(std.mem.indexOf(u8, section_prefix, "●") != null);
+    try std.testing.expect(std.mem.startsWith(u8, section_prefix, " "));
+    try std.testing.expect(std.mem.indexOf(u8, section_prefix, neon_yellow) != null);
+}
+
+test "branch_prefix contains dim branch character" {
+    try std.testing.expect(std.mem.indexOf(u8, branch_prefix, "⎿") != null);
+    try std.testing.expect(std.mem.indexOf(u8, branch_prefix, dim) != null);
+    try std.testing.expect(std.mem.indexOf(u8, branch_prefix, reset) != null);
+}
+
+test "detail_prefix is six spaces" {
+    try std.testing.expectEqualStrings("      ", detail_prefix);
+    try std.testing.expectEqual(@as(usize, 6), detail_prefix.len);
 }
