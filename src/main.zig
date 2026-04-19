@@ -1102,7 +1102,7 @@ fn formatEpoch(buf: *[20]u8, ts: i64) []const u8 {
     const month_day = year_day.calculateMonthDay();
     const day_secs = epoch.getDaySeconds();
     return std.fmt.bufPrint(buf, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-        year_day.year, month_day.month.numeric(), month_day.day_index + 1,
+        year_day.year,              month_day.month.numeric(),     month_day.day_index + 1,
         day_secs.getHoursIntoDay(), day_secs.getMinutesIntoHour(), day_secs.getSecondsIntoMinute(),
     }) catch "";
 }
@@ -1172,8 +1172,8 @@ fn writeCheckText(
         for (dmarc_fails[0..limit]) |f| {
             var lbuf: [256]u8 = undefined;
             const line = std.fmt.bufPrint(&lbuf, detail_prefix ++ "   {s:<18} {d:>6} {s:<6} {s:<6} {s:<20} {s}\n", .{
-                truncate(f.source_ip, 18), f.count, truncate(f.dkim, 6), truncate(f.spf, 6),
-                truncate(f.domain, 20), truncate(f.org, 20),
+                truncate(f.source_ip, 18), f.count,             truncate(f.dkim, 6), truncate(f.spf, 6),
+                truncate(f.domain, 20),    truncate(f.org, 20),
             }) catch continue;
             stdout_file.writeAll(line) catch {};
         }
