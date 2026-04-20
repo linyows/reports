@@ -292,7 +292,7 @@ pub fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: 
             if (all_txt) |records| {
                 defer allocator.free(records);
                 for (records) |txt| {
-                    if (std.mem.indexOf(u8, txt, "v=spf1") != null) {
+                    if (spf_txt == null and std.mem.indexOf(u8, txt, "v=spf1") != null) {
                         spf_txt = txt;
                     } else {
                         allocator.free(txt);

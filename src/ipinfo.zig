@@ -436,15 +436,17 @@ fn buildDnsQueryPacket(buf: *[512]u8, name: []const u8) !usize {
 }
 
 fn parseTxtFromResponse(allocator: Allocator, data: []const u8) ![]const u8 {
-    var results = try parseAllTxtFromResponse(allocator, data);
-    defer {
-        for (results) |r| allocator.free(r);
-        if (results.len > 0) allocator.free(results);
+    const results = try parseAllTxtFromResponse(allocator, data);
+    if (results.len == 0) {
+        allocator.free(results);
+        return error.NoAnswer;
     }
-    if (results.len == 0) return error.NoAnswer;
-    // Return first record; others are freed by defer above
+
     const first = results[0];
-    results[0] = "";
+    defer {
+        for (results[1..]) |r| allocator.free(r);
+        allocator.free(results);
+    }
     return first;
 }
 
@@ -861,4 +863,137 @@ test "parseCymruAsnOrg handles empty org name" {
     const allocator = std.testing.allocator;
     // 5th field is empty
     try std.testing.expect(parseCymruAsnOrg(allocator, "15169 | US | arin | 2000-01-01 | ") == null);
+}
+
+test "parseAllTxtFromResponse returns multiple TXT records" {
+    const allocator = std.testing.allocator;
+
+    // Build a minimal DNS response with 2 TXT answer records.
+    // Header: ID=0xABCD, flags=0x8180 (response, no error), QD=1, AN=2, NS=0, AR=0
+    // Question: 07 "example" 03 "com" 00, QTYPE=TXT(16), QCLASS=IN(1)
+    // Answer 1: pointer to question name (C0 0C), TYPE=TXT, CLASS=IN, TTL=0, RDATA="hello"
+    // Answer 2: pointer to question name (C0 0C), TYPE=TXT, CLASS=IN, TTL=0, RDATA="world"
+    const packet = [_]u8{
+        // Header (12 bytes)
+        0xAB, 0xCD, // ID
+        0x81, 0x80, // Flags: response, recursion available
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x02, // ANCOUNT = 2
+        0x00, 0x00, // NSCOUNT = 0
+        0x00, 0x00, // ARCOUNT = 0
+        // Question: example.com TXT IN
+        0x07, 'e',
+        'x',  'a',
+        'm',  'p',
+        'l',  'e',
+        0x03, 'c',
+        'o',  'm',
+        0x00, // end of name
+        0x00, 0x10, // QTYPE = TXT (16)
+        0x00, 0x01, // QCLASS = IN (1)
+        // Answer 1: "hello"
+        0xC0, 0x0C, // Name pointer to offset 12
+        0x00, 0x10, // TYPE = TXT
+        0x00, 0x01, // CLASS = IN
+        0x00, 0x00, 0x00, 0x00, // TTL = 0
+        0x00, 0x06, // RDLENGTH = 6
+        0x05, 'h', 'e', 'l', 'l', 'o', // TXT: length=5, "hello"
+        // Answer 2: "world"
+        0xC0, 0x0C, // Name pointer
+        0x00, 0x10, // TYPE = TXT
+        0x00, 0x01, // CLASS = IN
+        0x00, 0x00, 0x00, 0x00, // TTL = 0
+        0x00, 0x06, // RDLENGTH = 6
+        0x05, 'w', 'o', 'r', 'l', 'd', // TXT: length=5, "world"
+    };
+
+    const results = try parseAllTxtFromResponse(allocator, &packet);
+    defer {
+        for (results) |r| allocator.free(r);
+        allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("hello", results[0]);
+    try std.testing.expectEqualStrings("world", results[1]);
+}
+
+test "parseAllTxtFromResponse skips non-TXT answer records" {
+    const allocator = std.testing.allocator;
+
+    // Response with 2 answers: first is A record (type 1), second is TXT
+    const packet = [_]u8{
+        // Header
+        0xAB, 0xCD, 0x81, 0x80,
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x02, // ANCOUNT = 2
+        0x00, 0x00,
+        0x00, 0x00,
+        // Question: example.com TXT IN
+        0x07, 'e',
+        'x',  'a',
+        'm',  'p',
+        'l',  'e',
+        0x03, 'c',
+        'o',  'm',
+        0x00,
+        0x00, 0x10, // QTYPE = TXT
+        0x00, 0x01, // QCLASS = IN
+        // Answer 1: A record (should be skipped)
+        0xC0, 0x0C,
+        0x00, 0x01, // TYPE = A (1)
+        0x00, 0x01, // CLASS = IN
+        0x00, 0x00, 0x00, 0x00, // TTL
+        0x00, 0x04, // RDLENGTH = 4
+        0x01, 0x02, 0x03, 0x04, // RDATA: 1.2.3.4
+        // Answer 2: TXT record
+        0xC0, 0x0C,
+        0x00, 0x10, // TYPE = TXT (16)
+        0x00, 0x01, // CLASS = IN
+        0x00, 0x00, 0x00, 0x00, // TTL
+        0x00, 0x04, // RDLENGTH = 4
+        0x03, 'S', 'P', 'F', // TXT: length=3, "SPF"
+    };
+
+    const results = try parseAllTxtFromResponse(allocator, &packet);
+    defer {
+        for (results) |r| allocator.free(r);
+        allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("SPF", results[0]);
+}
+
+test "parseTxtFromResponse returns first of multiple records" {
+    const allocator = std.testing.allocator;
+
+    const packet = [_]u8{
+        0xAB, 0xCD, 0x81, 0x80,
+        0x00, 0x01, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x00,
+        0x07, 'e',  'x',  'a',
+        'm',  'p',  'l',  'e',
+        0x03, 'c',  'o',  'm',
+        0x00, 0x00, 0x10, 0x00,
+        0x01,
+        // Answer 1: "first"
+        0xC0, 0x0C, 0x00,
+        0x10, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x06, 0x05, 'f',  'i',
+        'r',  's',  't',
+        // Answer 2: "second"
+         0xC0,
+        0x0C, 0x00, 0x10, 0x00,
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x07, 0x06,
+        's',  'e',  'c',  'o',
+        'n',  'd',
+    };
+
+    const result = try parseTxtFromResponse(allocator, &packet);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("first", result);
 }
