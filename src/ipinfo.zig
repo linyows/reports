@@ -349,6 +349,49 @@ pub fn queryTxt(allocator: Allocator, name: []const u8) ![]const u8 {
     return parseTxtFromResponse(allocator, resp_buf[0..@intCast(recv_result)]);
 }
 
+/// Query all TXT records for a DNS name.
+/// Caller must free each returned slice and the outer slice.
+pub fn queryAllTxt(allocator: Allocator, name: []const u8) ![][]const u8 {
+    const ns_ip = getNameserver(allocator) catch try allocator.dupe(u8, "8.8.8.8");
+    defer allocator.free(ns_ip);
+
+    var query_buf: [512]u8 = undefined;
+    const query_len = try buildDnsQueryPacket(&query_buf, name);
+
+    const sock = c.socket(c.AF_INET, c.SOCK_DGRAM, 0);
+    if (sock < 0) return error.SocketError;
+    defer _ = c.close(sock);
+
+    var tv: c.struct_timeval = undefined;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    _ = c.setsockopt(sock, c.SOL_SOCKET, c.SO_RCVTIMEO, @ptrCast(&tv), @sizeOf(c.struct_timeval));
+
+    var addr: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, 53);
+
+    const ns_z = try allocator.dupeZ(u8, ns_ip);
+    defer allocator.free(ns_z);
+    if (c.inet_pton(c.AF_INET, ns_z.ptr, &addr.sin_addr) != 1) return error.InvalidNameserver;
+
+    const send_result = c.sendto(
+        sock,
+        @ptrCast(&query_buf),
+        @intCast(query_len),
+        0,
+        @ptrCast(&addr),
+        @sizeOf(c.struct_sockaddr_in),
+    );
+    if (send_result < 0) return error.SendFailed;
+
+    var resp_buf: [4096]u8 = undefined;
+    const recv_result = c.recvfrom(sock, @ptrCast(&resp_buf), resp_buf.len, 0, null, null);
+    if (recv_result < 12) return error.RecvFailed;
+
+    return parseAllTxtFromResponse(allocator, resp_buf[0..@intCast(recv_result)]);
+}
+
 fn buildDnsQueryPacket(buf: *[512]u8, name: []const u8) !usize {
     // Header (12 bytes)
     buf[0] = 0xAB;
@@ -393,9 +436,23 @@ fn buildDnsQueryPacket(buf: *[512]u8, name: []const u8) !usize {
 }
 
 fn parseTxtFromResponse(allocator: Allocator, data: []const u8) ![]const u8 {
+    const results = try parseAllTxtFromResponse(allocator, data);
+    if (results.len == 0) {
+        allocator.free(results);
+        return error.NoAnswer;
+    }
+
+    const first = results[0];
+    defer {
+        for (results[1..]) |r| allocator.free(r);
+        allocator.free(results);
+    }
+    return first;
+}
+
+fn parseAllTxtFromResponse(allocator: Allocator, data: []const u8) ![][]const u8 {
     if (data.len < 12) return error.ResponseTooShort;
 
-    // Check response flags for errors
     const flags = std.mem.readInt(u16, data[2..4], .big);
     const rcode = flags & 0x0F;
     if (rcode != 0) return error.DnsError;
@@ -405,7 +462,6 @@ fn parseTxtFromResponse(allocator: Allocator, data: []const u8) ![]const u8 {
 
     if (ancount == 0) return error.NoAnswer;
 
-    // Skip header
     var offset: usize = 12;
 
     // Skip question section
@@ -414,31 +470,44 @@ fn parseTxtFromResponse(allocator: Allocator, data: []const u8) ![]const u8 {
         offset += 4; // QTYPE + QCLASS
     }
 
-    // Parse first answer
-    offset = try skipDnsName(data, offset);
-
-    // TYPE(2) + CLASS(2) + TTL(4)
-    if (offset + 10 > data.len) return error.ParseError;
-    offset += 8;
-
-    const rdlength = std.mem.readInt(u16, data[offset..][0..2], .big);
-    offset += 2;
-
-    if (offset + rdlength > data.len) return error.ParseError;
-
-    // Parse TXT RDATA: concatenate all character-strings
-    var txt: std.ArrayList(u8) = .empty;
-    errdefer txt.deinit(allocator);
-    var rdata_offset: usize = 0;
-    while (rdata_offset < rdlength) {
-        const txt_len: usize = data[offset + rdata_offset];
-        rdata_offset += 1;
-        if (rdata_offset + txt_len > rdlength) break;
-        try txt.appendSlice(allocator, data[offset + rdata_offset .. offset + rdata_offset + txt_len]);
-        rdata_offset += txt_len;
+    // Parse all answer records
+    var results: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (results.items) |r| allocator.free(r);
+        results.deinit(allocator);
     }
 
-    return txt.toOwnedSlice(allocator);
+    for (0..ancount) |_| {
+        offset = try skipDnsName(data, offset);
+
+        if (offset + 10 > data.len) return error.ParseError;
+        const rtype = std.mem.readInt(u16, data[offset..][0..2], .big);
+        offset += 8; // TYPE(2) + CLASS(2) + TTL(4)
+
+        const rdlength = std.mem.readInt(u16, data[offset..][0..2], .big);
+        offset += 2;
+
+        if (offset + rdlength > data.len) return error.ParseError;
+
+        // Only parse TXT records (type 16)
+        if (rtype == 16) {
+            var txt: std.ArrayList(u8) = .empty;
+            errdefer txt.deinit(allocator);
+            var rdata_offset: usize = 0;
+            while (rdata_offset < rdlength) {
+                const txt_len: usize = data[offset + rdata_offset];
+                rdata_offset += 1;
+                if (rdata_offset + txt_len > rdlength) break;
+                try txt.appendSlice(allocator, data[offset + rdata_offset .. offset + rdata_offset + txt_len]);
+                rdata_offset += txt_len;
+            }
+            try results.append(allocator, try txt.toOwnedSlice(allocator));
+        }
+
+        offset += rdlength;
+    }
+
+    return results.toOwnedSlice(allocator);
 }
 
 fn skipDnsName(data: []const u8, start: usize) !usize {
@@ -794,4 +863,137 @@ test "parseCymruAsnOrg handles empty org name" {
     const allocator = std.testing.allocator;
     // 5th field is empty
     try std.testing.expect(parseCymruAsnOrg(allocator, "15169 | US | arin | 2000-01-01 | ") == null);
+}
+
+test "parseAllTxtFromResponse returns multiple TXT records" {
+    const allocator = std.testing.allocator;
+
+    // Build a minimal DNS response with 2 TXT answer records.
+    // Header: ID=0xABCD, flags=0x8180 (response, no error), QD=1, AN=2, NS=0, AR=0
+    // Question: 07 "example" 03 "com" 00, QTYPE=TXT(16), QCLASS=IN(1)
+    // Answer 1: pointer to question name (C0 0C), TYPE=TXT, CLASS=IN, TTL=0, RDATA="hello"
+    // Answer 2: pointer to question name (C0 0C), TYPE=TXT, CLASS=IN, TTL=0, RDATA="world"
+    const packet = [_]u8{
+        // Header (12 bytes)
+        0xAB, 0xCD, // ID
+        0x81, 0x80, // Flags: response, recursion available
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x02, // ANCOUNT = 2
+        0x00, 0x00, // NSCOUNT = 0
+        0x00, 0x00, // ARCOUNT = 0
+        // Question: example.com TXT IN
+        0x07, 'e',
+        'x',  'a',
+        'm',  'p',
+        'l',  'e',
+        0x03, 'c',
+        'o',  'm',
+        0x00, // end of name
+        0x00, 0x10, // QTYPE = TXT (16)
+        0x00, 0x01, // QCLASS = IN (1)
+        // Answer 1: "hello"
+        0xC0, 0x0C, // Name pointer to offset 12
+        0x00, 0x10, // TYPE = TXT
+        0x00, 0x01, // CLASS = IN
+        0x00, 0x00, 0x00, 0x00, // TTL = 0
+        0x00, 0x06, // RDLENGTH = 6
+        0x05, 'h', 'e', 'l', 'l', 'o', // TXT: length=5, "hello"
+        // Answer 2: "world"
+        0xC0, 0x0C, // Name pointer
+        0x00, 0x10, // TYPE = TXT
+        0x00, 0x01, // CLASS = IN
+        0x00, 0x00, 0x00, 0x00, // TTL = 0
+        0x00, 0x06, // RDLENGTH = 6
+        0x05, 'w', 'o', 'r', 'l', 'd', // TXT: length=5, "world"
+    };
+
+    const results = try parseAllTxtFromResponse(allocator, &packet);
+    defer {
+        for (results) |r| allocator.free(r);
+        allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("hello", results[0]);
+    try std.testing.expectEqualStrings("world", results[1]);
+}
+
+test "parseAllTxtFromResponse skips non-TXT answer records" {
+    const allocator = std.testing.allocator;
+
+    // Response with 2 answers: first is A record (type 1), second is TXT
+    const packet = [_]u8{
+        // Header
+        0xAB, 0xCD, 0x81, 0x80,
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x02, // ANCOUNT = 2
+        0x00, 0x00,
+        0x00, 0x00,
+        // Question: example.com TXT IN
+        0x07, 'e',
+        'x',  'a',
+        'm',  'p',
+        'l',  'e',
+        0x03, 'c',
+        'o',  'm',
+        0x00,
+        0x00, 0x10, // QTYPE = TXT
+        0x00, 0x01, // QCLASS = IN
+        // Answer 1: A record (should be skipped)
+        0xC0, 0x0C,
+        0x00, 0x01, // TYPE = A (1)
+        0x00, 0x01, // CLASS = IN
+        0x00, 0x00, 0x00, 0x00, // TTL
+        0x00, 0x04, // RDLENGTH = 4
+        0x01, 0x02, 0x03, 0x04, // RDATA: 1.2.3.4
+        // Answer 2: TXT record
+        0xC0, 0x0C,
+        0x00, 0x10, // TYPE = TXT (16)
+        0x00, 0x01, // CLASS = IN
+        0x00, 0x00, 0x00, 0x00, // TTL
+        0x00, 0x04, // RDLENGTH = 4
+        0x03, 'S', 'P', 'F', // TXT: length=3, "SPF"
+    };
+
+    const results = try parseAllTxtFromResponse(allocator, &packet);
+    defer {
+        for (results) |r| allocator.free(r);
+        allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("SPF", results[0]);
+}
+
+test "parseTxtFromResponse returns first of multiple records" {
+    const allocator = std.testing.allocator;
+
+    const packet = [_]u8{
+        0xAB, 0xCD, 0x81, 0x80,
+        0x00, 0x01, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x00,
+        0x07, 'e',  'x',  'a',
+        'm',  'p',  'l',  'e',
+        0x03, 'c',  'o',  'm',
+        0x00, 0x00, 0x10, 0x00,
+        0x01,
+        // Answer 1: "first"
+        0xC0, 0x0C, 0x00,
+        0x10, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x06, 0x05, 'f',  'i',
+        'r',  's',  't',
+        // Answer 2: "second"
+         0xC0,
+        0x0C, 0x00, 0x10, 0x00,
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x07, 0x06,
+        's',  'e',  'c',  'o',
+        'n',  'd',
+    };
+
+    const result = try parseTxtFromResponse(allocator, &packet);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("first", result);
 }
