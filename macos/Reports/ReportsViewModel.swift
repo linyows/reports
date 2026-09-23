@@ -26,11 +26,29 @@ final class ReportsViewModel: ObservableObject {
     @Published var showAddAccount = false
     @Published var mailSources: [MailSource] = []
     @Published var isLoadingSources = false
+    @Published var lastUpdated: Date? {
+        didSet {
+            if let lastUpdated {
+                UserDefaults.standard.set(lastUpdated.timeIntervalSince1970, forKey: Self.lastUpdatedKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.lastUpdatedKey)
+            }
+        }
+    }
+
+    private static let lastUpdatedKey = "lastUpdatedAt"
 
     private let core = ReportsCore.shared
     private var enrichmentTask: Task<Void, Never>?
     private var detailTask: Task<Void, Never>?
     private var sourcesTask: Task<Void, Never>?
+
+    init() {
+        let stored = UserDefaults.standard.double(forKey: Self.lastUpdatedKey)
+        if stored > 0 {
+            self.lastUpdated = Date(timeIntervalSince1970: stored)
+        }
+    }
 
     var selectedEntry: ReportEntry? {
         guard let id = selectedEntryID else { return nil }
@@ -164,6 +182,7 @@ final class ReportsViewModel: ObservableObject {
         errorMessage = nil
         do {
             try await core.sync()
+            lastUpdated = Date()
             loadReports()
         } catch {
             errorMessage = error.localizedDescription

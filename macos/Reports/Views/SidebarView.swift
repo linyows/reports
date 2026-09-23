@@ -13,7 +13,7 @@ struct SidebarView: View {
                 SidebarButton(
                     title: "Dashboard",
                     icon: "square.grid.2x2",
-                    count: viewModel.entries.count,
+                    count: nil,
                     color: .primary,
                     isSelected: viewModel.showDashboard
                 ) {
@@ -176,7 +176,7 @@ struct SidebarButton: View {
     let title: String
     var icon: String? = nil
     var showDot: Bool = false
-    let count: Int
+    let count: Int?
     var color: Color = .secondary
     let isSelected: Bool
     var isLoading: Bool = false
@@ -200,7 +200,7 @@ struct SidebarButton: View {
             if isSelected && isLoading {
                 ProgressView()
                     .controlSize(.small)
-            } else {
+            } else if let count {
                 Text("\(count)")
                     .font(.caption)
                     .padding(.horizontal, 6)
