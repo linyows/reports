@@ -6,7 +6,7 @@ Thank you for your interest in contributing! This guide explains how to get star
 
 ### Prerequisites
 
-- Zig 0.15.2 or later
+- Zig 0.16.0 or later
 - libxml2, libcurl, zlib (included in macOS SDK)
 - Xcode 16+ (for macOS app development)
 

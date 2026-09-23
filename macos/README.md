@@ -7,7 +7,7 @@ Built with SwiftUI, powered by the Zig core library (`libreports-core.a`) via C 
 
 | Tool | Version | Install |
 |------|---------|---------|
-| [Zig](https://ziglang.org/) | 0.15.2+ | [Download](https://ziglang.org/download/) |
+| [Zig](https://ziglang.org/) | 0.16.0+ | [Download](https://ziglang.org/download/) |
 | Xcode | 16.0+ | App Store |
 | [xcodegen](https://github.com/yonaskolb/XcodeGen) | Latest | `brew install xcodegen` |
 

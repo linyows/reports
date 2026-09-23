@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
         "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/libxml2",
         "/usr/include/libxml2",
     }) |path| {
-        if (std.fs.accessAbsolute(path, .{})) |_| {
+        if (std.Io.Dir.accessAbsolute(b.graph.io, path, .{})) |_| {
             mod.addSystemIncludePath(.{ .cwd_relative = path });
         } else |_| {}
     }

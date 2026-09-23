@@ -10,8 +10,21 @@ pub const section_prefix = " " ++ neon_yellow ++ "●" ++ reset ++ " ";
 pub const branch_prefix = "   " ++ dim ++ "⎿" ++ reset ++ "  ";
 pub const detail_prefix = "      ";
 
-pub const stdout_file = std.fs.File.stdout();
-pub const stderr_file = std.fs.File.stderr();
+/// Io used for terminal output. main() replaces it with the process Io
+/// before any output is written.
+pub var io: std.Io = std.Io.Threaded.global_single_threaded.io();
+
+/// Unbuffered handle to a standard stream.
+pub const StdStream = struct {
+    file: std.Io.File,
+
+    pub fn writeAll(self: StdStream, bytes: []const u8) !void {
+        try self.file.writeStreamingAll(io, bytes);
+    }
+};
+
+pub const stdout_file: StdStream = .{ .file = .stdout() };
+pub const stderr_file: StdStream = .{ .file = .stderr() };
 
 pub const ColSpec = struct {
     val: []const u8,

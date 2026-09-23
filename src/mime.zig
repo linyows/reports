@@ -32,7 +32,7 @@ pub fn extractAttachments(allocator: Allocator, raw: []const u8) ![]Attachment {
     _ = parts.next(); // preamble
 
     while (parts.next()) |part_raw| {
-        const part = std.mem.trimLeft(u8, part_raw, "\r\n");
+        const part = std.mem.trimStart(u8, part_raw, "\r\n");
         if (part.len == 0 or std.mem.startsWith(u8, part, "--")) continue;
 
         const ct = findHeaderValue(part, "Content-Type") orelse "";
@@ -181,7 +181,7 @@ fn findHeaderValue(data: []const u8, header_name: []const u8) ?[]const u8 {
     const headers = data[0..headers_end];
     var lines = std.mem.splitSequence(u8, headers, "\n");
     while (lines.next()) |line| {
-        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (std.ascii.startsWithIgnoreCase(trimmed, header_name)) {
             const after_name = trimmed[header_name.len..];
             if (after_name.len > 0 and after_name[0] == ':') {
@@ -475,13 +475,19 @@ fn decodeBody(allocator: Allocator, body: []const u8, encoding: ?[]const u8) ![]
     if (std.ascii.indexOfIgnoreCase(enc, "base64") != null) {
         var clean: std.ArrayList(u8) = .empty;
         defer clean.deinit(allocator);
-        for (body) |ch| {
-            if (std.mem.indexOfScalar(u8, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=", ch) != null) {
-                try clean.append(allocator, ch);
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |line| {
+            // A boundary delimiter line ends the encoded payload.
+            if (std.mem.startsWith(u8, std.mem.trim(u8, line, " \t\r"), "--")) break;
+            for (line) |ch| {
+                if (std.mem.indexOfScalar(u8, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=", ch) != null) {
+                    try clean.append(allocator, ch);
+                }
             }
         }
         const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(clean.items) catch return error.Base64DecodeError;
         const decoded = try allocator.alloc(u8, decoded_len);
+        errdefer allocator.free(decoded);
         std.base64.standard.Decoder.decode(decoded, clean.items) catch return error.Base64DecodeError;
         return decoded;
     }

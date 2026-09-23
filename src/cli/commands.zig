@@ -7,12 +7,12 @@ const Store = reports.store.Store;
 
 // --- Fetch ---
 
-pub fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, refetch: bool) !void {
-    const cfg = try Config.load(allocator);
+pub fn cmdFetch(allocator: std.mem.Allocator, io: std.Io, account_filter: ?[]const u8, refetch: bool) !void {
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
 
-    reports.store.migrateToAccountDirs(cfg.data_dir);
-    try cfg.ensureDataDir();
+    reports.store.migrateToAccountDirs(io, cfg.data_dir);
+    try cfg.ensureDataDir(io);
 
     if (cfg.accounts.len == 0) {
         ui.stderr_file.writeAll("No accounts configured. Edit ~/.config/reports/config.json\n") catch {};
@@ -37,7 +37,7 @@ pub fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, refet
             ui.stdout_file.writeAll(msg) catch {};
         }
 
-        const result = fetchForAccount(allocator, &acct, cfg.data_dir, refetch);
+        const result = fetchForAccount(allocator, io, &acct, cfg.data_dir, refetch);
 
         var buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, ui.detail_prefix ++ "Fetched {d} DMARC and {d} TLS-RPT reports\n", .{
@@ -47,7 +47,7 @@ pub fn cmdFetch(allocator: std.mem.Allocator, account_filter: ?[]const u8, refet
     }
 }
 
-fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, data_dir: []const u8, refetch: bool) struct { dmarc: u32, tls: u32 } {
+fn fetchForAccount(allocator: std.mem.Allocator, io: std.Io, acct: *const Config.Account, data_dir: []const u8, refetch: bool) struct { dmarc: u32, tls: u32 } {
     var client = reports.imap.Client.init(
         allocator,
         acct.host,
@@ -65,7 +65,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
     };
     defer client.deinit();
 
-    const st = Store.init(allocator, data_dir, acct.name);
+    const st = Store.init(allocator, io, data_dir, acct.name);
 
     var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
     defer fetched_set.deinit();
@@ -104,7 +104,7 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
             const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K" ++ ui.detail_prefix ++ "[{d}/{d}]", .{ progress.load(.monotonic), new_uid_slice.len }) catch "";
             ui.stderr_file.writeAll(prog) catch {};
         }
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        io.sleep(.fromMilliseconds(200), .awake) catch {};
     }
     job.join();
     {
@@ -119,17 +119,17 @@ fn fetchForAccount(allocator: std.mem.Allocator, acct: *const Config.Account, da
 
 // --- Enrich ---
 
-pub fn cmdEnrich(allocator: std.mem.Allocator) !void {
-    const cfg = try Config.load(allocator);
+pub fn cmdEnrich(allocator: std.mem.Allocator, io: std.Io) !void {
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
-    try enrichAllIps(allocator, &cfg);
+    try enrichAllIps(allocator, io, &cfg);
 }
 
-fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
+fn enrichAllIps(allocator: std.mem.Allocator, io: std.Io, cfg: *const Config) !void {
     const names = try cfg.accountNames(allocator);
     defer allocator.free(names);
 
-    const ips = try reports.fetch.collectSourceIps(allocator, cfg.data_dir, names);
+    const ips = try reports.fetch.collectSourceIps(allocator, io, cfg.data_dir, names);
     defer reports.fetch.freeIpList(allocator, ips);
 
     if (ips.len == 0) {
@@ -138,7 +138,7 @@ fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
         return;
     }
 
-    var cache = try reports.enrichcache.Cache.init(allocator, cfg.data_dir);
+    var cache = try reports.enrichcache.Cache.init(allocator, io, cfg.data_dir);
     defer cache.deinit();
 
     var pending: usize = 0;
@@ -179,7 +179,7 @@ fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
         var pbuf: [64]u8 = undefined;
         const prog = std.fmt.bufPrint(&pbuf, "\r\x1b[K" ++ ui.detail_prefix ++ "[{d}/{d}]", .{ progress.load(.monotonic), ips.len }) catch "";
         ui.stderr_file.writeAll(prog) catch {};
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        io.sleep(.fromMilliseconds(200), .awake) catch {};
     }
     thread.join();
     ui.stderr_file.writeAll("\r\x1b[K") catch {};
@@ -192,23 +192,23 @@ fn enrichAllIps(allocator: std.mem.Allocator, cfg: *const Config) !void {
 
 // --- Aggregate ---
 
-pub fn cmdAggregate(allocator: std.mem.Allocator) !void {
-    const cfg = try Config.load(allocator);
+pub fn cmdAggregate(allocator: std.mem.Allocator, io: std.Io) !void {
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
 
     const names = cfg.accountNames(allocator) catch return;
     defer allocator.free(names);
 
-    const entries = reports.store.listAllReports(allocator, cfg.data_dir, names) catch return;
+    const entries = reports.store.listAllReports(allocator, io, cfg.data_dir, names) catch return;
     defer reports.store.freeReportEntries(allocator, entries);
 
-    const ips = reports.fetch.collectSourceIps(allocator, cfg.data_dir, names) catch return;
+    const ips = reports.fetch.collectSourceIps(allocator, io, cfg.data_dir, names) catch return;
     defer reports.fetch.freeIpList(allocator, ips);
 
     for ([_][]const u8{ ".sources_cache.json", ".dashboard_cache.json" }) |filename| {
         const path = std.fs.path.join(allocator, &.{ cfg.data_dir, filename }) catch continue;
         defer allocator.free(path);
-        std.fs.deleteFileAbsolute(path) catch {};
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
     }
 
     ui.stdout_file.writeAll(ui.section_prefix ++ "Reports Aggregation\n") catch {};
@@ -222,8 +222,8 @@ pub fn cmdAggregate(allocator: std.mem.Allocator) !void {
 
 // --- DNS ---
 
-pub fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: []const u8) !void {
-    const cfg = try Config.load(allocator);
+pub fn cmdDns(allocator: std.mem.Allocator, io: std.Io, domain_filter: ?[]const u8, format: []const u8) !void {
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
 
     var domains: std.ArrayList([]const u8) = .empty;
@@ -235,7 +235,7 @@ pub fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: 
     if (domain_filter) |d| {
         domains.append(allocator, allocator.dupe(u8, d) catch return) catch {};
     } else {
-        const entries = try data.loadEntries(allocator, &cfg, null);
+        const entries = try data.loadEntries(allocator, io, &cfg, null);
         defer reports.store.freeReportEntries(allocator, entries);
 
         var domain_set = std.StringHashMap(void).init(allocator);
@@ -283,12 +283,12 @@ pub fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: 
         {
             const qname = std.fmt.allocPrint(allocator, "_dmarc.{s}", .{domain}) catch continue;
             defer allocator.free(qname);
-            dmarc_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
+            dmarc_txt = reports.ipinfo.queryTxt(allocator, io, qname) catch null;
         }
 
         // SPF — search all TXT records since DNS response order is not guaranteed
         {
-            const all_txt = reports.ipinfo.queryAllTxt(allocator, domain) catch null;
+            const all_txt = reports.ipinfo.queryAllTxt(allocator, io, domain) catch null;
             if (all_txt) |records| {
                 defer allocator.free(records);
                 for (records) |txt| {
@@ -305,7 +305,7 @@ pub fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: 
         for ([_][]const u8{ "default", "google", "selector1", "selector2", "s1", "s2", "dkim", "mail" }) |selector| {
             const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{ selector, domain }) catch continue;
             defer allocator.free(qname);
-            if (reports.ipinfo.queryTxt(allocator, qname)) |txt| {
+            if (reports.ipinfo.queryTxt(allocator, io, qname)) |txt| {
                 if (std.mem.indexOf(u8, txt, "DKIM1") != null or std.mem.indexOf(u8, txt, "p=") != null) {
                     dkim_txt = txt;
                     dkim_selector = selector;
@@ -320,14 +320,14 @@ pub fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: 
         {
             const qname = std.fmt.allocPrint(allocator, "_mta-sts.{s}", .{domain}) catch continue;
             defer allocator.free(qname);
-            mta_sts_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
+            mta_sts_txt = reports.ipinfo.queryTxt(allocator, io, qname) catch null;
         }
 
         // TLS-RPT
         {
             const qname = std.fmt.allocPrint(allocator, "_smtp._tls.{s}", .{domain}) catch continue;
             defer allocator.free(qname);
-            tls_rpt_txt = reports.ipinfo.queryTxt(allocator, qname) catch null;
+            tls_rpt_txt = reports.ipinfo.queryTxt(allocator, io, qname) catch null;
         }
 
         const dmarc_policy_weak = if (dmarc_txt) |t| reports.stats.isDmarcPolicyWeak(t) else false;
@@ -430,11 +430,11 @@ pub fn cmdDns(allocator: std.mem.Allocator, domain_filter: ?[]const u8, format: 
 
 // --- Domains ---
 
-pub fn cmdDomains(allocator: std.mem.Allocator, format: []const u8, account: ?[]const u8) !void {
-    const cfg = try Config.load(allocator);
+pub fn cmdDomains(allocator: std.mem.Allocator, io: std.Io, format: []const u8, account: ?[]const u8) !void {
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
 
-    const entries = try data.loadEntries(allocator, &cfg, account);
+    const entries = try data.loadEntries(allocator, io, &cfg, account);
     defer reports.store.freeReportEntries(allocator, entries);
 
     var domain_set = std.StringHashMap(void).init(allocator);
@@ -479,11 +479,11 @@ pub fn cmdDomains(allocator: std.mem.Allocator, format: []const u8, account: ?[]
 
 // --- Summary ---
 
-pub fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8, account: ?[]const u8, period: ?[]const u8) !void {
-    const cfg = try Config.load(allocator);
+pub fn cmdSummary(allocator: std.mem.Allocator, io: std.Io, format: []const u8, domain: ?[]const u8, account: ?[]const u8, period: ?[]const u8) !void {
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
 
-    const entries = try data.loadEntries(allocator, &cfg, account);
+    const entries = try data.loadEntries(allocator, io, &cfg, account);
     defer reports.store.freeReportEntries(allocator, entries);
 
     const filtered = try data.filterByDomain(allocator, entries, domain);
@@ -494,17 +494,17 @@ pub fn cmdSummary(allocator: std.mem.Allocator, format: []const u8, domain: ?[]c
             ui.stderr_file.writeAll("Invalid period: use week, month, or year\n") catch {};
             return;
         }
-        try cmdSummaryByPeriod(allocator, &cfg, filtered, format, p);
+        try cmdSummaryByPeriod(allocator, io, &cfg, filtered, format, p);
     } else {
-        try cmdSummaryTotal(allocator, &cfg, filtered, format);
+        try cmdSummaryTotal(allocator, io, &cfg, filtered, format);
     }
 }
 
-fn cmdSummaryTotal(allocator: std.mem.Allocator, cfg: *const Config, filtered: []const reports.store.ReportEntry, format: []const u8) !void {
+fn cmdSummaryTotal(allocator: std.mem.Allocator, io: std.Io, cfg: *const Config, filtered: []const reports.store.ReportEntry, format: []const u8) !void {
     var stats: data.PeriodStats = .{};
 
     for (filtered) |entry| {
-        const st = Store.init(allocator, cfg.data_dir, entry.account_name);
+        const st = Store.init(allocator, io, cfg.data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
                 stats.dmarc += 1;
@@ -543,7 +543,7 @@ fn cmdSummaryTotal(allocator: std.mem.Allocator, cfg: *const Config, filtered: [
     }
 }
 
-fn cmdSummaryByPeriod(allocator: std.mem.Allocator, cfg: *const Config, filtered: []const reports.store.ReportEntry, format: []const u8, period: []const u8) !void {
+fn cmdSummaryByPeriod(allocator: std.mem.Allocator, io: std.Io, cfg: *const Config, filtered: []const reports.store.ReportEntry, format: []const u8, period: []const u8) !void {
     var period_map = std.StringHashMap(data.PeriodStats).init(allocator);
     defer {
         var it = period_map.iterator();
@@ -563,7 +563,7 @@ fn cmdSummaryByPeriod(allocator: std.mem.Allocator, cfg: *const Config, filtered
             gop.value_ptr.* = .{};
         }
 
-        const st = Store.init(allocator, cfg.data_dir, entry.account_name);
+        const st = Store.init(allocator, io, cfg.data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
                 gop.value_ptr.dmarc += 1;
@@ -704,16 +704,17 @@ const TlsCheckJson = struct {
 
 pub fn cmdCheck(
     allocator: std.mem.Allocator,
+    io: std.Io,
     domain_filter: ?[]const u8,
     account_filter: ?[]const u8,
     format: []const u8,
     threshold_str: ?[]const u8,
     max_age_str: ?[]const u8,
 ) !u8 {
-    const cfg = try Config.load(allocator);
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
 
-    const entries = try data.loadEntries(allocator, &cfg, account_filter);
+    const entries = try data.loadEntries(allocator, io, &cfg, account_filter);
     defer reports.store.freeReportEntries(allocator, entries);
 
     const filtered = try data.filterByDomain(allocator, entries, domain_filter);
@@ -733,7 +734,7 @@ pub fn cmdCheck(
             }
         }
 
-        const st = Store.init(allocator, cfg.data_dir, entry.account_name);
+        const st = Store.init(allocator, io, cfg.data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
                 result.dmarc_reports += 1;
@@ -831,7 +832,7 @@ pub fn cmdCheck(
     var stale = false;
 
     if (result.latest_date.len >= 10) {
-        const age = data.dateAgeDays(result.latest_date) catch null;
+        const age = data.dateAgeDays(result.latest_date, std.Io.Clock.real.now(io).toSeconds()) catch null;
         if (age) |days| {
             if (days > max_age) stale = true;
         }

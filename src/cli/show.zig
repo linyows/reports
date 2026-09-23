@@ -7,11 +7,11 @@ const enrich = @import("enrich.zig");
 const Config = reports.config.Config;
 const Store = reports.store.Store;
 
-pub fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []const u8, do_enrich: bool) !void {
-    const cfg = try Config.load(allocator);
+pub fn cmdShow(allocator: std.mem.Allocator, io: std.Io, report_id: []const u8, format: []const u8, do_enrich: bool) !void {
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
 
-    const entries = try data.loadEntries(allocator, &cfg, null);
+    const entries = try data.loadEntries(allocator, io, &cfg, null);
     defer reports.store.freeReportEntries(allocator, entries);
 
     for (entries) |entry| {
@@ -20,7 +20,7 @@ pub fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []co
             std.mem.indexOf(u8, entry.report_id, report_id) != null or
             std.mem.indexOf(u8, entry.filename, report_id) != null)
         {
-            const st = Store.init(allocator, cfg.data_dir, entry.account_name);
+            const st = Store.init(allocator, io, cfg.data_dir, entry.account_name);
             switch (entry.report_type) {
                 .dmarc => {
                     const report_data = try st.loadDmarcReport(entry.filename);
@@ -30,7 +30,7 @@ pub fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []co
                         ui.stdout_file.writeAll(report_data) catch {};
                         ui.stdout_file.writeAll("\n") catch {};
                     } else {
-                        try showDmarcTable(allocator, report_data, do_enrich, hash_id);
+                        try showDmarcTable(allocator, io, report_data, do_enrich, hash_id);
                     }
                 },
                 .tlsrpt => {
@@ -41,7 +41,7 @@ pub fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []co
                         ui.stdout_file.writeAll(report_data) catch {};
                         ui.stdout_file.writeAll("\n") catch {};
                     } else {
-                        try showTlsTable(allocator, report_data, do_enrich, hash_id);
+                        try showTlsTable(allocator, io, report_data, do_enrich, hash_id);
                     }
                 },
             }
@@ -54,11 +54,11 @@ pub fn cmdShow(allocator: std.mem.Allocator, report_id: []const u8, format: []co
     ui.stderr_file.writeAll("\n") catch {};
 }
 
-pub fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]const u8, account: ?[]const u8, report_type: ?[]const u8) !void {
-    const cfg = try Config.load(allocator);
+pub fn cmdList(allocator: std.mem.Allocator, io: std.Io, format: []const u8, domain: ?[]const u8, account: ?[]const u8, report_type: ?[]const u8) !void {
+    const cfg = try Config.load(allocator, io);
     defer cfg.deinit(allocator);
 
-    const entries = try data.loadEntries(allocator, &cfg, account);
+    const entries = try data.loadEntries(allocator, io, &cfg, account);
     defer reports.store.freeReportEntries(allocator, entries);
 
     const by_domain = try data.filterByDomain(allocator, entries, domain);
@@ -68,7 +68,7 @@ pub fn cmdList(allocator: std.mem.Allocator, format: []const u8, domain: ?[]cons
     defer allocator.free(filtered);
 
     if (std.mem.eql(u8, format, "json")) {
-        try writeJsonList(allocator, cfg.data_dir, filtered);
+        try writeJsonList(allocator, io, cfg.data_dir, filtered);
     } else {
         try writeTableList(allocator, filtered);
     }
@@ -126,7 +126,7 @@ const TlsDetailJson = struct {
     } = &.{},
 };
 
-fn showDmarcTable(allocator: std.mem.Allocator, report_data: []const u8, do_enrich: bool, hash_id: []const u8) !void {
+fn showDmarcTable(allocator: std.mem.Allocator, io: std.Io, report_data: []const u8, do_enrich: bool, hash_id: []const u8) !void {
     const parsed = try std.json.parseFromSlice(DmarcDetailJson, allocator, report_data, .{
         .ignore_unknown_fields = true,
     });
@@ -201,7 +201,7 @@ fn showDmarcTable(allocator: std.mem.Allocator, report_data: []const u8, do_enri
         var flag: []const u8 = try allocator.dupe(u8, "");
 
         if (do_enrich) {
-            const cached = enrich.lookupCached(allocator, &ip_cache, rec.source_ip);
+            const cached = enrich.lookupCached(allocator, io, &ip_cache, rec.source_ip);
 
             allocator.free(ptr_display);
             ptr_display = if (cached.ptr.len > 0 and !std.mem.eql(u8, cached.ptr, rec.source_ip))
@@ -316,7 +316,7 @@ fn showDmarcTable(allocator: std.mem.Allocator, report_data: []const u8, do_enri
     }
 }
 
-fn showTlsTable(allocator: std.mem.Allocator, report_data: []const u8, do_enrich: bool, hash_id: []const u8) !void {
+fn showTlsTable(allocator: std.mem.Allocator, io: std.Io, report_data: []const u8, do_enrich: bool, hash_id: []const u8) !void {
     const parsed = try std.json.parseFromSlice(TlsDetailJson, allocator, report_data, .{
         .ignore_unknown_fields = true,
     });
@@ -366,7 +366,7 @@ fn showTlsTable(allocator: std.mem.Allocator, report_data: []const u8, do_enrich
                 ui.stdout_file.writeAll(fline) catch {};
 
                 if (do_enrich and f.sending_mta_ip.len > 0) {
-                    const info = reports.ipinfo.lookup(allocator, f.sending_mta_ip);
+                    const info = reports.ipinfo.lookup(allocator, io, f.sending_mta_ip);
                     defer info.deinit(allocator);
                     const cached = enrich.CachedIpInfo{
                         .ptr = info.ptr,
@@ -444,8 +444,8 @@ fn writeTableList(allocator: std.mem.Allocator, entries: []const reports.store.R
     }
 }
 
-fn countProblems(alloc: std.mem.Allocator, data_dir: []const u8, entry: reports.store.ReportEntry) u64 {
-    const st = Store.init(alloc, data_dir, entry.account_name);
+fn countProblems(alloc: std.mem.Allocator, io: std.Io, data_dir: []const u8, entry: reports.store.ReportEntry) u64 {
+    const st = Store.init(alloc, io, data_dir, entry.account_name);
     switch (entry.report_type) {
         .dmarc => {
             const report_data = st.loadDmarcReport(entry.filename) catch return 0;
@@ -460,7 +460,7 @@ fn countProblems(alloc: std.mem.Allocator, data_dir: []const u8, entry: reports.
     }
 }
 
-fn writeJsonList(alloc: std.mem.Allocator, data_dir: []const u8, entries: []const reports.store.ReportEntry) !void {
+fn writeJsonList(alloc: std.mem.Allocator, io: std.Io, data_dir: []const u8, entries: []const reports.store.ReportEntry) !void {
     ui.stdout_file.writeAll("[") catch {};
     for (entries, 0..) |e, i| {
         if (i > 0) ui.stdout_file.writeAll(",") catch {};
@@ -469,7 +469,7 @@ fn writeJsonList(alloc: std.mem.Allocator, data_dir: []const u8, entries: []cons
             .tlsrpt => "tlsrpt",
         };
         const hash_id = data.filenameToHashId(e.filename);
-        const problems = countProblems(alloc, data_dir, e);
+        const problems = countProblems(alloc, io, data_dir, e);
         const json_entry = try std.fmt.allocPrint(alloc, "\n  {{\"account\":\"{s}\",\"type\":\"{s}\",\"org\":\"{s}\",\"id\":\"{s}\",\"date\":\"{s}\",\"domain\":\"{s}\",\"policy\":\"{s}\",\"filename\":\"{s}\",\"problems\":{d}}}", .{
             e.account_name, type_str, e.org_name, hash_id, e.date_begin, e.domain, e.policy, e.filename, problems,
         });

@@ -16,10 +16,10 @@ pub const CachedIpInfo = struct {
     }
 };
 
-pub fn lookupCached(allocator: std.mem.Allocator, cache: *std.StringHashMap(CachedIpInfo), ip: []const u8) *const CachedIpInfo {
+pub fn lookupCached(allocator: std.mem.Allocator, io: std.Io, cache: *std.StringHashMap(CachedIpInfo), ip: []const u8) *const CachedIpInfo {
     if (cache.getPtr(ip)) |existing| return existing;
 
-    const info = reports.ipinfo.lookup(allocator, ip);
+    const info = reports.ipinfo.lookup(allocator, io, ip);
     const entry = CachedIpInfo{
         .ptr = info.ptr,
         .asn = info.asn,

@@ -4,3 +4,4 @@ macos/Reports.xcodeproj/
 macos/ReportsKit.xcframework/
 macos/ReportsKit/reports.h
 macos/build/
+zig-pkg/

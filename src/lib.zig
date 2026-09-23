@@ -5,15 +5,20 @@ const reports = @import("reports");
 
 const allocator = std.heap.c_allocator;
 
+/// Io instance for the C ABI entry points. The library spawns its own worker
+/// threads via std.Thread and does not rely on Io async/concurrency.
+var g_threaded: std.Io.Threaded = .init_single_threaded;
+const io = g_threaded.io();
+
 /// Lazily-initialized global enrich cache, shared by reports_enrich_ip and reports_fetch.
 var g_cache: ?reports.enrichcache.Cache = null;
-var g_cache_mu: std.Thread.Mutex = .{};
+var g_cache_mu: std.Io.Mutex = .init;
 
 fn getCache(data_dir: []const u8) ?*reports.enrichcache.Cache {
-    g_cache_mu.lock();
-    defer g_cache_mu.unlock();
+    g_cache_mu.lockUncancelable(io);
+    defer g_cache_mu.unlock(io);
     if (g_cache == null) {
-        g_cache = reports.enrichcache.Cache.init(allocator, data_dir) catch return null;
+        g_cache = reports.enrichcache.Cache.init(allocator, io, data_dir) catch return null;
     }
     return &g_cache.?;
 }
@@ -24,8 +29,8 @@ export fn reports_init() void {
 
 export fn reports_deinit() void {
     reports.imap.globalCleanup();
-    g_cache_mu.lock();
-    defer g_cache_mu.unlock();
+    g_cache_mu.lockUncancelable(io);
+    defer g_cache_mu.unlock(io);
     if (g_cache) |*c| {
         c.compactIfNeeded() catch {};
         c.deinit();
@@ -37,8 +42,8 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
     const cfg = reports.config.Config.fromJson(allocator, std.mem.span(config_json)) catch return -1;
     defer cfg.deinit(allocator);
 
-    reports.store.migrateToAccountDirs(cfg.data_dir);
-    cfg.ensureDataDir() catch return -1;
+    reports.store.migrateToAccountDirs(io, cfg.data_dir);
+    cfg.ensureDataDir(io) catch return -1;
 
     var attempted: usize = 0;
     var succeeded: usize = 0;
@@ -59,7 +64,7 @@ export fn reports_fetch(config_json: [*:0]const u8) c_int {
         client.connect() catch continue;
         defer client.deinit();
 
-        const st = reports.store.Store.init(allocator, cfg.data_dir, acct.name);
+        const st = reports.store.Store.init(allocator, io, cfg.data_dir, acct.name);
 
         var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
         defer fetched_set.deinit();
@@ -99,8 +104,8 @@ export fn reports_fetch_account(config_json: [*:0]const u8, account_name: [*:0]c
         return errStr("Failed to parse configuration");
     defer cfg.deinit(allocator);
 
-    reports.store.migrateToAccountDirs(cfg.data_dir);
-    cfg.ensureDataDir() catch return errStr("Failed to create data directory");
+    reports.store.migrateToAccountDirs(io, cfg.data_dir);
+    cfg.ensureDataDir(io) catch return errStr("Failed to create data directory");
 
     const name = std.mem.span(account_name);
     for (cfg.accounts) |acct| {
@@ -119,7 +124,7 @@ export fn reports_fetch_account(config_json: [*:0]const u8, account_name: [*:0]c
         client.connect() catch return errStr("Failed to initialize IMAP client");
         defer client.deinit();
 
-        const st = reports.store.Store.init(allocator, cfg.data_dir, acct.name);
+        const st = reports.store.Store.init(allocator, io, cfg.data_dir, acct.name);
         var fetched_set = st.loadFetchedUids() catch std.AutoHashMap(u32, void).init(allocator);
         defer fetched_set.deinit();
 
@@ -165,7 +170,7 @@ export fn reports_enrich(config_json: [*:0]const u8) c_int {
     defer allocator.free(names);
 
     if (getCache(cfg.data_dir)) |cache| {
-        const ips = reports.fetch.collectSourceIps(allocator, cfg.data_dir, names) catch return -1;
+        const ips = reports.fetch.collectSourceIps(allocator, io, cfg.data_dir, names) catch return -1;
         defer reports.fetch.freeIpList(allocator, ips);
         reports.enrichcache.enrichParallel(cache, allocator, ips, null);
     }
@@ -200,7 +205,7 @@ export fn reports_list(config_json: [*:0]const u8) ?[*:0]u8 {
     const names = cfg.accountNames(allocator) catch return null;
     defer allocator.free(names);
 
-    const entries = reports.store.listAllReports(allocator, cfg.data_dir, names) catch return null;
+    const entries = reports.store.listAllReports(allocator, io, cfg.data_dir, names) catch return null;
     defer reports.store.freeReportEntries(allocator, entries);
 
     var buf: std.ArrayList(u8) = .empty;
@@ -248,9 +253,7 @@ const dashboard_cache_filename = ".dashboard_cache.json";
 fn readDashboardCache(data_dir: []const u8) ?[*:0]u8 {
     const path = std.fs.path.join(allocator, &.{ data_dir, dashboard_cache_filename }) catch return null;
     defer allocator.free(path);
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch return null;
     const result = allocator.dupeZ(u8, data) catch {
         allocator.free(data);
         return null;
@@ -262,13 +265,11 @@ fn readDashboardCache(data_dir: []const u8) ?[*:0]u8 {
 fn writeDashboardCache(data_dir: []const u8, json: []const u8) void {
     const path = std.fs.path.join(allocator, &.{ data_dir, dashboard_cache_filename }) catch return;
     defer allocator.free(path);
-    const file = std.fs.createFileAbsolute(path, .{}) catch return;
-    defer file.close();
-    file.writeAll(json) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json }) catch {};
 }
 
 fn buildAndCacheDashboard(data_dir: []const u8, names: []const []const u8) ?[*:0]u8 {
-    const entries = reports.store.listAllReports(allocator, data_dir, names) catch return null;
+    const entries = reports.store.listAllReports(allocator, io, data_dir, names) catch return null;
     defer reports.store.freeReportEntries(allocator, entries);
 
     const json = buildDashboardJson(data_dir, entries) orelse return null;
@@ -318,7 +319,7 @@ fn buildDashboardJson(data_dir: []const u8, entries: []const reports.store.Repor
     defer reports.stats.freeMapKeys(allocator, &tls_failure_types);
 
     for (entries) |entry| {
-        const st = reports.store.Store.init(allocator, data_dir, entry.account_name);
+        const st = reports.store.Store.init(allocator, io, data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
                 reports.stats.hashIncOwned(allocator, &dmarc_orgs, entry.org_name, 1);
@@ -510,9 +511,7 @@ fn readSourcesCache(data_dir: []const u8) ?[*:0]u8 {
     const path = sourceCachePath(data_dir) orelse return null;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch return null;
 
     // Return as null-terminated string
     const result = allocator.dupeZ(u8, data) catch {
@@ -527,9 +526,7 @@ fn writeSourcesCache(data_dir: []const u8, json: []const u8) void {
     const path = sourceCachePath(data_dir) orelse return;
     defer allocator.free(path);
 
-    const file = std.fs.createFileAbsolute(path, .{}) catch return;
-    defer file.close();
-    file.writeAll(json) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json }) catch {};
 }
 
 fn buildAndCacheSources(data_dir: []const u8) void {
@@ -539,7 +536,7 @@ fn buildAndCacheSources(data_dir: []const u8) void {
         for (names) |n| allocator.free(n);
         allocator.free(names);
     }
-    const entries = reports.store.listAllReports(allocator, data_dir, names) catch return;
+    const entries = reports.store.listAllReports(allocator, io, data_dir, names) catch return;
     defer reports.store.freeReportEntries(allocator, entries);
 
     const json = buildSourcesJson(data_dir, entries) orelse return;
@@ -548,7 +545,7 @@ fn buildAndCacheSources(data_dir: []const u8) void {
 }
 
 fn buildAndCacheSourcesWithNames(data_dir: []const u8, names: []const []const u8) ?[*:0]u8 {
-    const entries = reports.store.listAllReports(allocator, data_dir, names) catch return null;
+    const entries = reports.store.listAllReports(allocator, io, data_dir, names) catch return null;
     defer reports.store.freeReportEntries(allocator, entries);
 
     const json = buildSourcesJson(data_dir, entries) orelse return null;
@@ -582,7 +579,7 @@ fn buildSourcesJson(data_dir: []const u8, entries: []const reports.store.ReportE
     defer domain_map.deinit();
 
     for (entries) |entry| {
-        const st = reports.store.Store.init(allocator, data_dir, entry.account_name);
+        const st = reports.store.Store.init(allocator, io, data_dir, entry.account_name);
         switch (entry.report_type) {
             .dmarc => {
                 const data = st.loadDmarcReport(entry.filename) catch continue;
@@ -643,7 +640,7 @@ fn buildSourcesJson(data_dir: []const u8, entries: []const reports.store.ReportE
     }
 
     // Load enrich cache for PTR/ASN/country lookup
-    var enrich_cache: ?reports.enrichcache.Cache = reports.enrichcache.Cache.init(allocator, data_dir) catch null;
+    var enrich_cache: ?reports.enrichcache.Cache = reports.enrichcache.Cache.init(allocator, io, data_dir) catch null;
     defer if (enrich_cache) |*c| c.deinit();
 
     // Build JSON
@@ -731,12 +728,12 @@ fn buildSourcesJson(data_dir: []const u8, entries: []const reports.store.ReportE
 }
 
 fn scanAccountNames(data_dir: []const u8) ?[]const []const u8 {
-    var dir = std.fs.openDirAbsolute(data_dir, .{ .iterate = true }) catch return null;
-    defer dir.close();
+    var dir = std.Io.Dir.openDirAbsolute(io, data_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
 
     var names: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(io) catch null) |entry| {
         if (entry.kind != .directory) continue;
         // Skip hidden dirs
         if (entry.name.len > 0 and entry.name[0] == '.') continue;
@@ -772,7 +769,7 @@ export fn reports_show(config_json: [*:0]const u8, report_type: [*:0]const u8, a
     const cfg = reports.config.Config.fromJson(allocator, std.mem.span(config_json)) catch return null;
     defer cfg.deinit(allocator);
 
-    const st = reports.store.Store.init(allocator, cfg.data_dir, std.mem.span(account_name));
+    const st = reports.store.Store.init(allocator, io, cfg.data_dir, std.mem.span(account_name));
 
     const type_span = std.mem.span(report_type);
     const fname = std.mem.span(filename);
@@ -791,7 +788,7 @@ export fn reports_show(config_json: [*:0]const u8, report_type: [*:0]const u8, a
 }
 
 fn countProblems(alloc: std.mem.Allocator, data_dir: []const u8, entry: reports.store.ReportEntry) u64 {
-    const st = reports.store.Store.init(alloc, data_dir, entry.account_name);
+    const st = reports.store.Store.init(alloc, io, data_dir, entry.account_name);
     switch (entry.report_type) {
         .dmarc => {
             const data = st.loadDmarcReport(entry.filename) catch return 0;
@@ -819,10 +816,10 @@ export fn reports_enrich_ip(ip: [*:0]const u8) ?[*:0]u8 {
     // Hold g_cache_mu across the entire cache access to prevent a use-after-free
     // if reports_deinit() runs concurrently. Cache.getDup has its own internal
     // mutex but that doesn't protect the g_cache pointer itself.
-    g_cache_mu.lock();
+    g_cache_mu.lockUncancelable(io);
     if (g_cache) |*c| {
         if (c.getDup(ip_span)) |entry| {
-            g_cache_mu.unlock();
+            g_cache_mu.unlock(io);
             defer reports.enrichcache.freeEntryFields(allocator, entry);
             const info = reports.enrichcache.entryToIpInfo(allocator, entry) catch return null;
             defer info.deinit(allocator);
@@ -833,18 +830,18 @@ export fn reports_enrich_ip(ip: [*:0]const u8) ?[*:0]u8 {
             return result.ptr;
         }
     }
-    g_cache_mu.unlock();
+    g_cache_mu.unlock(io);
 
     // Cache miss (or no cache): resolve via DNS, then try to write back under lock.
-    const info = reports.ipinfo.lookup(allocator, ip_span);
+    const info = reports.ipinfo.lookup(allocator, io, ip_span);
     defer info.deinit(allocator);
 
-    g_cache_mu.lock();
+    g_cache_mu.lockUncancelable(io);
     if (g_cache) |*c| {
         // put() appends to JSONL file directly; no separate save step needed.
         c.put(ip_span, info) catch {};
     }
-    g_cache_mu.unlock();
+    g_cache_mu.unlock(io);
 
     const json = info.toJson(allocator) catch return null;
     defer allocator.free(json);
