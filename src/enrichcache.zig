@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const ipinfo = @import("ipinfo.zig");
 
 pub const TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -24,17 +25,19 @@ pub const Entry = struct {
 
 pub const Cache = struct {
     allocator: Allocator,
+    io: Io,
     map: std.StringHashMap(Entry),
-    mutex: std.Thread.Mutex = .{},
+    mutex: Io.Mutex = .init,
     path: []const u8,
     /// Number of append-only lines written since the last compaction.
     /// Used to decide when to rewrite the file to reclaim space.
     appended_since_compact: usize = 0,
 
-    pub fn init(allocator: Allocator, data_dir: []const u8) !Cache {
+    pub fn init(allocator: Allocator, io: Io, data_dir: []const u8) !Cache {
         const path = try std.fs.path.join(allocator, &.{ data_dir, CACHE_FILENAME });
         var cache = Cache{
             .allocator = allocator,
+            .io = io,
             .map = std.StringHashMap(Entry).init(allocator),
             .path = path,
         };
@@ -47,7 +50,7 @@ pub const Cache = struct {
     fn cleanupOrphanTmp(self: *Cache) void {
         const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path}) catch return;
         defer self.allocator.free(tmp_path);
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        Io.Dir.deleteFileAbsolute(self.io, tmp_path) catch {};
     }
 
     pub fn deinit(self: *Cache) void {
@@ -62,20 +65,20 @@ pub const Cache = struct {
 
     /// Look up an entry. Returns a duplicated entry (caller owns strings) if found and fresh.
     pub fn getDup(self: *Cache, ip: []const u8) ?Entry {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const e = self.map.get(ip) orelse return null;
-        const now = std.time.timestamp();
+        const now = nowSeconds(self.io);
         if (now - e.ts > TTL_SECONDS) return null;
         return dupEntry(self.allocator, e) catch null;
     }
 
     /// Check if an IP has a fresh entry without allocating.
     pub fn hasFresh(self: *Cache, ip: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const e = self.map.get(ip) orelse return false;
-        const now = std.time.timestamp();
+        const now = nowSeconds(self.io);
         return (now - e.ts) <= TTL_SECONDS;
     }
 
@@ -84,13 +87,13 @@ pub const Cache = struct {
     /// Propagates I/O errors so callers can surface disk-full / permission issues
     /// rather than silently losing the persisted entry.
     pub fn put(self: *Cache, ip: []const u8, info: ipinfo.IpInfo) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const ip_copy = try self.allocator.dupe(u8, ip);
         errdefer self.allocator.free(ip_copy);
 
-        const entry = try makeEntry(self.allocator, info);
+        const entry = try makeEntry(self.allocator, info, nowSeconds(self.io));
         errdefer freeEntryFields(self.allocator, entry);
 
         if (self.map.fetchRemove(ip)) |old| {
@@ -113,8 +116,8 @@ pub const Cache = struct {
     /// Rewrite the file to remove duplicate/stale lines if it has grown too large.
     /// Triggered automatically at the end of parallel enrichment.
     pub fn compactIfNeeded(self: *Cache) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Compact when appended lines exceed the unique entry count,
         // i.e., the file is at least 2x the ideal size.
@@ -124,56 +127,58 @@ pub const Cache = struct {
 
     /// Force a full rewrite (used by tests and explicit compaction).
     pub fn compact(self: *Cache) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.rewriteLocked();
     }
 
     fn appendLine(self: *Cache, ip: []const u8, entry: Entry) !void {
         // Ensure parent dir exists
         if (std.fs.path.dirname(self.path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch {};
+            Io.Dir.createDirAbsolute(self.io, dir, .default_dir) catch {};
         }
 
         const line = try formatLine(self.allocator, ip, entry);
         defer self.allocator.free(line);
 
-        const file = try std.fs.createFileAbsolute(self.path, .{ .truncate = false });
-        defer file.close();
-        try file.seekFromEnd(0);
-        try file.writeAll(line);
+        const file = try Io.Dir.createFileAbsolute(self.io, self.path, .{ .truncate = false });
+        defer file.close(self.io);
+        try file.writePositionalAll(self.io, line, try file.length(self.io));
 
         self.appended_since_compact += 1;
     }
 
     fn rewriteLocked(self: *Cache) !void {
         if (std.fs.path.dirname(self.path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch {};
+            Io.Dir.createDirAbsolute(self.io, dir, .default_dir) catch {};
         }
 
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path});
         defer self.allocator.free(tmp_path);
 
         {
-            const file = try std.fs.createFileAbsolute(tmp_path, .{});
-            defer file.close();
+            const file = try Io.Dir.createFileAbsolute(self.io, tmp_path, .{});
+            defer file.close(self.io);
 
+            var buf: [4096]u8 = undefined;
+            var fw = file.writer(self.io, &buf);
             var it = self.map.iterator();
             while (it.next()) |kv| {
                 const line = try formatLine(self.allocator, kv.key_ptr.*, kv.value_ptr.*);
                 defer self.allocator.free(line);
-                try file.writeAll(line);
+                try fw.interface.writeAll(line);
             }
+            try fw.interface.flush();
         }
-        try std.fs.renameAbsolute(tmp_path, self.path);
+        try Io.Dir.renameAbsolute(tmp_path, self.path, self.io);
         self.appended_since_compact = 0;
     }
 
     fn loadFromDisk(self: *Cache) !void {
-        const file = std.fs.openFileAbsolute(self.path, .{}) catch return;
-        defer file.close();
-
-        const data = try file.readToEndAlloc(self.allocator, 256 * 1024 * 1024);
+        const data = Io.Dir.cwd().readFileAlloc(self.io, self.path, self.allocator, .limited(256 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
         defer self.allocator.free(data);
 
         var line_count: usize = 0;
@@ -278,7 +283,11 @@ fn tsField(v: ?std.json.Value) i64 {
     return 0;
 }
 
-fn makeEntry(allocator: Allocator, info: ipinfo.IpInfo) !Entry {
+fn nowSeconds(io: Io) i64 {
+    return Io.Clock.real.now(io).toSeconds();
+}
+
+fn makeEntry(allocator: Allocator, info: ipinfo.IpInfo, now: i64) !Entry {
     const ptr_copy = try allocator.dupe(u8, info.ptr);
     errdefer allocator.free(ptr_copy);
     const asn_copy = try allocator.dupe(u8, info.asn);
@@ -291,7 +300,7 @@ fn makeEntry(allocator: Allocator, info: ipinfo.IpInfo) !Entry {
         .asn = asn_copy,
         .asn_org = org_copy,
         .country = country_copy,
-        .ts = std.time.timestamp(),
+        .ts = now,
     };
 }
 
@@ -339,7 +348,7 @@ fn enrichWorker(ctx: *EnrichCtx) void {
             _ = p.fetchAdd(1, .monotonic);
         };
         if (ctx.cache.hasFresh(ip)) continue;
-        const info = ipinfo.lookup(ctx.allocator, ip);
+        const info = ipinfo.lookup(ctx.allocator, ctx.cache.io, ip);
         defer info.deinit(ctx.allocator);
         ctx.cache.put(ip, info) catch {};
     }
@@ -394,12 +403,12 @@ const testing = std.testing;
 
 test "cache round-trip: put and getDup" {
     const allocator = testing.allocator;
-    const tmp_dir = testing.tmpDir(.{});
+    var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    var cache = try Cache.init(allocator, tmp_path);
+    var cache = try Cache.init(allocator, testing.io, tmp_path);
     defer cache.deinit();
 
     const info = ipinfo.IpInfo{
@@ -427,13 +436,13 @@ test "cache round-trip: put and getDup" {
 
 test "cache persistence across instances (JSONL append)" {
     const allocator = testing.allocator;
-    const tmp_dir = testing.tmpDir(.{});
+    var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
     {
-        var cache = try Cache.init(allocator, tmp_path);
+        var cache = try Cache.init(allocator, testing.io, tmp_path);
         defer cache.deinit();
 
         const info = ipinfo.IpInfo{
@@ -447,7 +456,7 @@ test "cache persistence across instances (JSONL append)" {
     }
 
     {
-        var cache = try Cache.init(allocator, tmp_path);
+        var cache = try Cache.init(allocator, testing.io, tmp_path);
         defer cache.deinit();
         const got = cache.getDup("9.9.9.9") orelse {
             try testing.expect(false);
@@ -461,13 +470,13 @@ test "cache persistence across instances (JSONL append)" {
 
 test "later duplicates overwrite earlier entries" {
     const allocator = testing.allocator;
-    const tmp_dir = testing.tmpDir(.{});
+    var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
     {
-        var cache = try Cache.init(allocator, tmp_path);
+        var cache = try Cache.init(allocator, testing.io, tmp_path);
         defer cache.deinit();
 
         const old_info = ipinfo.IpInfo{
@@ -490,7 +499,7 @@ test "later duplicates overwrite earlier entries" {
     }
 
     // Re-open: the latest line should win
-    var cache = try Cache.init(allocator, tmp_path);
+    var cache = try Cache.init(allocator, testing.io, tmp_path);
     defer cache.deinit();
     const got = cache.getDup("2.2.2.2") orelse {
         try testing.expect(false);
@@ -503,12 +512,12 @@ test "later duplicates overwrite earlier entries" {
 
 test "compaction removes duplicate lines" {
     const allocator = testing.allocator;
-    const tmp_dir = testing.tmpDir(.{});
+    var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    var cache = try Cache.init(allocator, tmp_path);
+    var cache = try Cache.init(allocator, testing.io, tmp_path);
     defer cache.deinit();
 
     // Put the same IP 5 times → 5 lines, 1 unique entry
@@ -530,9 +539,7 @@ test "compaction removes duplicate lines" {
     // Verify file has only 1 line after compaction
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, CACHE_FILENAME });
     defer allocator.free(file_path);
-    const file = try std.fs.openFileAbsolute(file_path, .{});
-    defer file.close();
-    const data = try file.readToEndAlloc(allocator, 1024);
+    const data = try std.Io.Dir.cwd().readFileAlloc(testing.io, file_path, allocator, .limited(1024));
     defer allocator.free(data);
 
     var count: usize = 0;
@@ -545,12 +552,12 @@ test "compaction removes duplicate lines" {
 
 test "expired entries are not returned" {
     const allocator = testing.allocator;
-    const tmp_dir = testing.tmpDir(.{});
+    var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    var cache = try Cache.init(allocator, tmp_path);
+    var cache = try Cache.init(allocator, testing.io, tmp_path);
     defer cache.deinit();
 
     // Manually insert a stale entry
@@ -560,10 +567,51 @@ test "expired entries are not returned" {
         .asn = try allocator.dupe(u8, ""),
         .asn_org = try allocator.dupe(u8, ""),
         .country = try allocator.dupe(u8, ""),
-        .ts = std.time.timestamp() - TTL_SECONDS - 100,
+        .ts = nowSeconds(testing.io) - TTL_SECONDS - 100,
     };
     try cache.map.put(ip_copy, entry);
 
     try testing.expect(!cache.hasFresh("1.1.1.1"));
     try testing.expectEqual(@as(?Entry, null), cache.getDup("1.1.1.1"));
+}
+
+test "concurrent put from worker threads keeps all entries" {
+    const allocator = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const threads_n = 4;
+    const per_thread = 25;
+
+    {
+        var cache = try Cache.init(allocator, testing.io, tmp_path);
+        defer cache.deinit();
+
+        const Worker = struct {
+            fn run(c: *Cache, id: usize) void {
+                for (0..per_thread) |i| {
+                    var buf: [32]u8 = undefined;
+                    const ip = std.fmt.bufPrint(&buf, "10.0.{d}.{d}", .{ id, i }) catch return;
+                    const info = ipinfo.IpInfo{ .ptr = "p", .asn = "1", .asn_org = "o", .country = "JP" };
+                    c.put(ip, info) catch return;
+                }
+            }
+        };
+
+        var threads: [threads_n]std.Thread = undefined;
+        for (&threads, 0..) |*t, id| {
+            t.* = try std.Thread.spawn(.{}, Worker.run, .{ &cache, id });
+        }
+        for (threads) |t| t.join();
+
+        try testing.expectEqual(@as(u32, threads_n * per_thread), cache.map.count());
+    }
+
+    // Every appended line must be intact and reload into the same set of entries.
+    var reloaded = try Cache.init(allocator, testing.io, tmp_path);
+    defer reloaded.deinit();
+    try testing.expectEqual(@as(u32, threads_n * per_thread), reloaded.map.count());
+    try testing.expect(reloaded.hasFresh("10.0.3.24"));
 }

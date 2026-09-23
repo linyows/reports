@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const dns = @import("dns.zig");
 
 const c = @cImport({
@@ -28,7 +29,7 @@ pub const IpInfo = struct {
     }
 };
 
-pub fn lookup(allocator: Allocator, ip: []const u8) IpInfo {
+pub fn lookup(allocator: Allocator, io: Io, ip: []const u8) IpInfo {
     const ptr = dns.reverseLookup(allocator, ip) catch allocator.dupe(u8, "") catch return emptyInfo(allocator);
 
     if (isPrivateIp(ip)) {
@@ -55,7 +56,7 @@ pub fn lookup(allocator: Allocator, ip: []const u8) IpInfo {
     if (buildOriginQuery(allocator, ip)) |origin_query| {
         defer allocator.free(origin_query);
 
-        if (queryTxt(allocator, origin_query)) |txt| {
+        if (queryTxt(allocator, io, origin_query)) |txt| {
             defer allocator.free(txt);
             if (parseCymruOrigin(allocator, txt)) |parsed| {
                 allocator.free(asn);
@@ -71,7 +72,7 @@ pub fn lookup(allocator: Allocator, ip: []const u8) IpInfo {
         if (std.fmt.allocPrint(allocator, "AS{s}.asn.cymru.com", .{asn})) |asn_query| {
             defer allocator.free(asn_query);
 
-            if (queryTxt(allocator, asn_query)) |txt| {
+            if (queryTxt(allocator, io, asn_query)) |txt| {
                 defer allocator.free(txt);
                 if (parseCymruAsnOrg(allocator, txt)) |org| {
                     allocator.free(asn_org);
@@ -294,7 +295,7 @@ fn parseCymruAsnOrg(allocator: Allocator, txt: []const u8) ?[]const u8 {
 
     const trimmed = std.mem.trim(u8, org_part, " \t\"\n\r");
     // Remove trailing comma variants
-    const clean = std.mem.trimRight(u8, trimmed, ",");
+    const clean = std.mem.trimEnd(u8, trimmed, ",");
     if (clean.len == 0) return null;
 
     return allocator.dupe(u8, clean) catch null;
@@ -302,8 +303,8 @@ fn parseCymruAsnOrg(allocator: Allocator, txt: []const u8) ?[]const u8 {
 
 // --- DNS TXT query via raw UDP ---
 
-pub fn queryTxt(allocator: Allocator, name: []const u8) ![]const u8 {
-    const ns_ip = getNameserver(allocator) catch try allocator.dupe(u8, "8.8.8.8");
+pub fn queryTxt(allocator: Allocator, io: Io, name: []const u8) ![]const u8 {
+    const ns_ip = getNameserver(allocator, io) catch try allocator.dupe(u8, "8.8.8.8");
     defer allocator.free(ns_ip);
 
     // Build DNS query packet
@@ -351,8 +352,8 @@ pub fn queryTxt(allocator: Allocator, name: []const u8) ![]const u8 {
 
 /// Query all TXT records for a DNS name.
 /// Caller must free each returned slice and the outer slice.
-pub fn queryAllTxt(allocator: Allocator, name: []const u8) ![][]const u8 {
-    const ns_ip = getNameserver(allocator) catch try allocator.dupe(u8, "8.8.8.8");
+pub fn queryAllTxt(allocator: Allocator, io: Io, name: []const u8) ![][]const u8 {
+    const ns_ip = getNameserver(allocator, io) catch try allocator.dupe(u8, "8.8.8.8");
     defer allocator.free(ns_ip);
 
     var query_buf: [512]u8 = undefined;
@@ -521,12 +522,8 @@ fn skipDnsName(data: []const u8, start: usize) !usize {
     return error.InvalidDnsName;
 }
 
-fn getNameserver(allocator: Allocator) ![]const u8 {
-    const file = std.fs.openFileAbsolute("/etc/resolv.conf", .{}) catch
-        return try allocator.dupe(u8, "8.8.8.8");
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 64 * 1024) catch
+fn getNameserver(allocator: Allocator, io: Io) ![]const u8 {
+    const content = Io.Dir.cwd().readFileAlloc(io, "/etc/resolv.conf", allocator, .limited(64 * 1024)) catch
         return try allocator.dupe(u8, "8.8.8.8");
     defer allocator.free(content);
 
@@ -649,14 +646,14 @@ test "skipDnsName handles compression pointer" {
 test "getNameserver returns fallback" {
     const allocator = std.testing.allocator;
     // This test just verifies getNameserver doesn't crash
-    const ns = getNameserver(allocator) catch try allocator.dupe(u8, "8.8.8.8");
+    const ns = getNameserver(allocator, std.testing.io) catch try allocator.dupe(u8, "8.8.8.8");
     defer allocator.free(ns);
     try std.testing.expect(ns.len > 0);
 }
 
 test "lookup returns empty info for private IPs without network" {
     const allocator = std.testing.allocator;
-    const info = lookup(allocator, "10.0.0.1");
+    const info = lookup(allocator, std.testing.io, "10.0.0.1");
     defer info.deinit(allocator);
     // Private IPs should skip Cymru lookup
     try std.testing.expectEqualStrings("", info.asn);

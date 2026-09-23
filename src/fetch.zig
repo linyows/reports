@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const imap = @import("imap.zig");
 const mime = @import("mime.zig");
 const mtasts = @import("mtasts.zig");
@@ -204,6 +205,7 @@ pub fn processResults(
 /// Caller owns the returned slice and each inner string.
 pub fn collectSourceIps(
     allocator: Allocator,
+    io: Io,
     data_dir: []const u8,
     account_names: []const []const u8,
 ) ![]const []const u8 {
@@ -215,8 +217,8 @@ pub fn collectSourceIps(
     }
 
     for (account_names) |name| {
-        try collectFromAccount(allocator, data_dir, name, "dmarc", &set);
-        try collectFromAccount(allocator, data_dir, name, "tlsrpt", &set);
+        try collectFromAccount(allocator, io, data_dir, name, "dmarc", &set);
+        try collectFromAccount(allocator, io, data_dir, name, "tlsrpt", &set);
     }
 
     var list: std.ArrayList([]const u8) = .empty;
@@ -231,6 +233,7 @@ pub fn collectSourceIps(
 
 fn collectFromAccount(
     allocator: Allocator,
+    io: Io,
     data_dir: []const u8,
     account_name: []const u8,
     subdir: []const u8,
@@ -239,19 +242,15 @@ fn collectFromAccount(
     const dir_path = try std.fs.path.join(allocator, &.{ data_dir, account_name, subdir });
     defer allocator.free(dir_path);
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
-        const data = blk: {
-            const file = dir.openFile(entry.name, .{}) catch continue;
-            defer file.close();
-            break :blk file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch continue;
-        };
+        const data = dir.readFileAlloc(io, entry.name, allocator, .limited(10 * 1024 * 1024)) catch continue;
         defer allocator.free(data);
 
         extractIpsFromJson(allocator, data, subdir, set) catch continue;
@@ -405,12 +404,12 @@ test "processResults skips entries with null data" {
         .{ .uid = 1, .data = null },
         .{ .uid = 2, .data = null },
     };
-    const tmp_dir = testing.tmpDir(.{});
+    var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const st = store.Store.init(allocator, tmp_path, "test");
+    const st = store.Store.init(allocator, testing.io, tmp_path, "test");
     var fetched_set = std.AutoHashMap(u32, void).init(allocator);
     defer fetched_set.deinit();
 
@@ -427,12 +426,12 @@ test "processResults does not duplicate markUidFetched for already-fetched UIDs"
     const results = [_]FetchResult{
         .{ .uid = 42, .data = null },
     };
-    const tmp_dir = testing.tmpDir(.{});
+    var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const st = store.Store.init(allocator, tmp_path, "test");
+    const st = store.Store.init(allocator, testing.io, tmp_path, "test");
     var fetched_set = std.AutoHashMap(u32, void).init(allocator);
     defer fetched_set.deinit();
     try fetched_set.put(42, {});

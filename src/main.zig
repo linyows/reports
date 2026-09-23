@@ -7,13 +7,12 @@ const ui = @import("cli/ui.zig");
 const logo_text = @embedFile("assets/logo.txt");
 const desc_text = @embedFile("assets/desc.txt");
 
-pub fn main() !void {
-    var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa_impl.deinit();
-    const allocator = gpa_impl.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    ui.io = io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         printUsage();
@@ -30,36 +29,36 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "sync")) {
         const refetch = hasFlag(args, "--refetch");
-        try commands.cmdFetch(allocator, account, refetch);
+        try commands.cmdFetch(allocator, io, account, refetch);
         ui.stdout_file.writeAll("\n") catch {};
-        try commands.cmdEnrich(allocator);
+        try commands.cmdEnrich(allocator, io);
         ui.stdout_file.writeAll("\n") catch {};
-        try commands.cmdAggregate(allocator);
+        try commands.cmdAggregate(allocator, io);
     } else if (std.mem.eql(u8, command, "fetch")) {
         const refetch = hasFlag(args, "--refetch");
-        try commands.cmdFetch(allocator, account, refetch);
+        try commands.cmdFetch(allocator, io, account, refetch);
     } else if (std.mem.eql(u8, command, "enrich")) {
-        try commands.cmdEnrich(allocator);
+        try commands.cmdEnrich(allocator, io);
     } else if (std.mem.eql(u8, command, "aggregate")) {
-        try commands.cmdAggregate(allocator);
+        try commands.cmdAggregate(allocator, io);
     } else if (std.mem.eql(u8, command, "list")) {
-        try show.cmdList(allocator, format orelse "text", domain, account, report_type);
+        try show.cmdList(allocator, io, format orelse "text", domain, account, report_type);
     } else if (std.mem.eql(u8, command, "show")) {
         if (args.len < 3 or std.mem.startsWith(u8, args[2], "--")) {
             ui.stderr_file.writeAll("Usage: reports show <report-id>\n") catch {};
             return;
         }
-        try show.cmdShow(allocator, args[2], format orelse "text", enrich);
+        try show.cmdShow(allocator, io, args[2], format orelse "text", enrich);
     } else if (std.mem.eql(u8, command, "dns")) {
-        try commands.cmdDns(allocator, domain, format orelse "text");
+        try commands.cmdDns(allocator, io, domain, format orelse "text");
     } else if (std.mem.eql(u8, command, "domains")) {
-        try commands.cmdDomains(allocator, format orelse "text", account);
+        try commands.cmdDomains(allocator, io, format orelse "text", account);
     } else if (std.mem.eql(u8, command, "summary")) {
-        try commands.cmdSummary(allocator, format orelse "text", domain, account, period);
+        try commands.cmdSummary(allocator, io, format orelse "text", domain, account, period);
     } else if (std.mem.eql(u8, command, "check")) {
         const threshold = getOption(args, "--threshold");
         const max_age = getOption(args, "--max-age");
-        const exit_code = try commands.cmdCheck(allocator, domain, account, format orelse "text", threshold, max_age);
+        const exit_code = try commands.cmdCheck(allocator, io, domain, account, format orelse "text", threshold, max_age);
         if (exit_code != 0) std.process.exit(exit_code);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage();
@@ -122,7 +121,7 @@ fn printUsage() void {
     ) catch {};
 }
 
-fn getOption(args: []const []const u8, name: []const u8) ?[]const u8 {
+fn getOption(args: []const [:0]const u8, name: []const u8) ?[]const u8 {
     for (args, 0..) |arg, i| {
         if (std.mem.eql(u8, arg, name) and i + 1 < args.len) {
             return args[i + 1];
@@ -131,7 +130,7 @@ fn getOption(args: []const []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn hasFlag(args: []const []const u8, name: []const u8) bool {
+fn hasFlag(args: []const [:0]const u8, name: []const u8) bool {
     for (args) |arg| {
         if (std.mem.eql(u8, arg, name)) return true;
     }

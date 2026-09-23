@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const zlug = @import("zlug");
 const dmarc = @import("dmarc.zig");
 const mtasts = @import("mtasts.zig");
@@ -23,11 +24,12 @@ pub const ReportEntry = struct {
 
 pub const Store = struct {
     allocator: Allocator,
+    io: Io,
     data_dir: []const u8,
     account_name: []const u8,
 
-    pub fn init(allocator: Allocator, data_dir: []const u8, account_name: []const u8) Store {
-        return .{ .allocator = allocator, .data_dir = data_dir, .account_name = account_name };
+    pub fn init(allocator: Allocator, io: Io, data_dir: []const u8, account_name: []const u8) Store {
+        return .{ .allocator = allocator, .io = io, .data_dir = data_dir, .account_name = account_name };
     }
 
     pub fn saveDmarcReport(self: *const Store, report: *const dmarc.Report) !void {
@@ -43,9 +45,7 @@ pub const Store = struct {
         const json = try report.toJson(self.allocator);
         defer self.allocator.free(json);
 
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(json);
+        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = json });
     }
 
     pub fn saveTlsReport(self: *const Store, report: *const mtasts.Report) !void {
@@ -61,9 +61,7 @@ pub const Store = struct {
         const json = try report.toJson(self.allocator);
         defer self.allocator.free(json);
 
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(json);
+        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = json });
     }
 
     pub fn loadFetchedUids(self: *const Store) !std.AutoHashMap(u32, void) {
@@ -72,10 +70,7 @@ pub const Store = struct {
         const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, ".fetched_uids" });
         defer self.allocator.free(path);
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch return set;
-        defer file.close();
-
-        const content = file.readToEndAlloc(self.allocator, 1 * 1024 * 1024) catch return set;
+        const content = Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 * 1024 * 1024)) catch return set;
         defer self.allocator.free(content);
 
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -93,13 +88,13 @@ pub const Store = struct {
         const path = std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, ".fetched_uids" }) catch return;
         defer self.allocator.free(path);
 
-        const file = std.fs.createFileAbsolute(path, .{ .truncate = false }) catch return;
-        defer file.close();
-        file.seekFromEnd(0) catch {};
+        const file = Io.Dir.createFileAbsolute(self.io, path, .{ .truncate = false }) catch return;
+        defer file.close(self.io);
+        const end = file.length(self.io) catch return;
 
         var buf: [16]u8 = undefined;
         const uid_str = std.fmt.bufPrint(&buf, "{d}\n", .{uid}) catch return;
-        file.writeAll(uid_str) catch {};
+        file.writePositionalAll(self.io, uid_str, end) catch {};
     }
 
     pub fn listReports(self: *const Store) ![]ReportEntry {
@@ -117,37 +112,29 @@ pub const Store = struct {
         const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "dmarc", filename });
         defer self.allocator.free(path);
 
-        const file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
-        return file.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
+        return Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(10 * 1024 * 1024));
     }
 
     pub fn loadTlsReport(self: *const Store, filename: []const u8) ![]const u8 {
         const path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, "tlsrpt", filename });
         defer self.allocator.free(path);
 
-        const file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
-        return file.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
+        return Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(10 * 1024 * 1024));
     }
 
     fn scanDir(self: *const Store, subdir: []const u8, report_type: ReportType, entries: *std.ArrayList(ReportEntry)) !void {
         const dir_path = try std.fs.path.join(self.allocator, &.{ self.data_dir, self.account_name, subdir });
         defer self.allocator.free(dir_path);
 
-        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = Io.Dir.openDirAbsolute(self.io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
 
-            const data = blk: {
-                const file = dir.openFile(entry.name, .{}) catch continue;
-                defer file.close();
-                break :blk file.readToEndAlloc(self.allocator, 10 * 1024 * 1024) catch continue;
-            };
+            const data = dir.readFileAlloc(self.io, entry.name, self.allocator, .limited(10 * 1024 * 1024)) catch continue;
             defer self.allocator.free(data);
 
             const re = parseEntryFromJson(self.allocator, data, report_type, self.account_name, entry.name) catch continue;
@@ -157,11 +144,11 @@ pub const Store = struct {
 };
 
 /// List reports across all accounts, sorted by date descending.
-pub fn listAllReports(allocator: Allocator, data_dir: []const u8, account_names: []const []const u8) ![]ReportEntry {
+pub fn listAllReports(allocator: Allocator, io: Io, data_dir: []const u8, account_names: []const []const u8) ![]ReportEntry {
     var all: std.ArrayList(ReportEntry) = .empty;
 
     for (account_names) |name| {
-        const st = Store.init(allocator, data_dir, name);
+        const st = Store.init(allocator, io, data_dir, name);
         const entries = try st.listReports();
         defer allocator.free(entries);
         for (entries) |e| {
@@ -176,7 +163,7 @@ pub fn listAllReports(allocator: Allocator, data_dir: []const u8, account_names:
 
 /// Migrate legacy flat directory layout to per-account layout.
 /// Moves {data_dir}/dmarc/ and {data_dir}/tlsrpt/ into {data_dir}/default/.
-pub fn migrateToAccountDirs(data_dir: []const u8) void {
+pub fn migrateToAccountDirs(io: Io, data_dir: []const u8) void {
     const allocator = std.heap.page_allocator;
 
     // Check if legacy dmarc/ dir exists at top level
@@ -187,22 +174,22 @@ pub fn migrateToAccountDirs(data_dir: []const u8) void {
     defer allocator.free(default_dir);
 
     // If default/ already exists or legacy dmarc/ doesn't exist, nothing to do
-    std.fs.accessAbsolute(default_dir, .{}) catch {
+    Io.Dir.accessAbsolute(io, default_dir, .{}) catch {
         // default/ doesn't exist — check if legacy dirs do
-        std.fs.accessAbsolute(legacy_dmarc, .{}) catch return;
+        Io.Dir.accessAbsolute(io, legacy_dmarc, .{}) catch return;
 
         // Create default/ and move legacy dirs into it
-        std.fs.makeDirAbsolute(default_dir) catch return;
+        Io.Dir.createDirAbsolute(io, default_dir, .default_dir) catch return;
 
         const target_dmarc = std.fs.path.join(allocator, &.{ default_dir, "dmarc" }) catch return;
         defer allocator.free(target_dmarc);
-        std.fs.renameAbsolute(legacy_dmarc, target_dmarc) catch {};
+        Io.Dir.renameAbsolute(legacy_dmarc, target_dmarc, io) catch {};
 
         const legacy_tlsrpt = std.fs.path.join(allocator, &.{ data_dir, "tlsrpt" }) catch return;
         defer allocator.free(legacy_tlsrpt);
         const target_tlsrpt = std.fs.path.join(allocator, &.{ default_dir, "tlsrpt" }) catch return;
         defer allocator.free(target_tlsrpt);
-        std.fs.renameAbsolute(legacy_tlsrpt, target_tlsrpt) catch {};
+        Io.Dir.renameAbsolute(legacy_tlsrpt, target_tlsrpt, io) catch {};
 
         return;
     };
@@ -387,14 +374,15 @@ test "parseEntryFromJson parses dmarc entry with account" {
 test "listReports sorts by date descending with account dirs" {
     const allocator = std.testing.allocator;
 
-    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_dir = std.testing.tmpDir(.{});
+    const io = std.testing.io;
+    var tmp_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpath(".", &tmp_buf);
+    const tmp_path = tmp_buf[0..try tmp_dir.dir.realPath(io, &tmp_buf)];
 
     // Create account/dmarc and account/tlsrpt dirs
-    try tmp_dir.dir.makePath("myacct/dmarc");
-    try tmp_dir.dir.makePath("myacct/tlsrpt");
+    try tmp_dir.dir.createDirPath(io, "myacct/dmarc");
+    try tmp_dir.dir.createDirPath(io, "myacct/tlsrpt");
 
     const report_old =
         \\{"metadata":{"org_name":"a.com","report_id":"old","date_begin":1600000000,"date_end":1600086400},"policy":{"domain":"d.com"},"records":[]}
@@ -403,18 +391,18 @@ test "listReports sorts by date descending with account dirs" {
         \\{"metadata":{"org_name":"b.com","report_id":"new","date_begin":1700000000,"date_end":1700086400},"policy":{"domain":"d.com"},"records":[]}
     ;
 
-    var dmarc_dir = try tmp_dir.dir.openDir("myacct/dmarc", .{});
-    defer dmarc_dir.close();
+    var dmarc_dir = try tmp_dir.dir.openDir(io, "myacct/dmarc", .{});
+    defer dmarc_dir.close(io);
 
-    var f1 = try dmarc_dir.createFile("old.json", .{});
-    try f1.writeAll(report_old);
-    f1.close();
+    var f1 = try dmarc_dir.createFile(io, "old.json", .{});
+    try f1.writeStreamingAll(io, report_old);
+    f1.close(io);
 
-    var f2 = try dmarc_dir.createFile("new.json", .{});
-    try f2.writeAll(report_new);
-    f2.close();
+    var f2 = try dmarc_dir.createFile(io, "new.json", .{});
+    try f2.writeStreamingAll(io, report_new);
+    f2.close(io);
 
-    const st = Store.init(allocator, tmp_path, "myacct");
+    const st = Store.init(allocator, io, tmp_path, "myacct");
     const entries = try st.listReports();
     defer freeReportEntries(allocator, entries);
 
@@ -428,35 +416,36 @@ test "migrateToAccountDirs moves legacy dirs" {
     const allocator = std.testing.allocator;
     _ = allocator;
 
-    const tmp_dir = std.testing.tmpDir(.{});
+    const io = std.testing.io;
+    var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp_dir.dir.realpath(".", &tmp_buf);
+    var tmp_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_path = tmp_buf[0..try tmp_dir.dir.realPath(io, &tmp_buf)];
 
     // Create legacy layout
-    try tmp_dir.dir.makeDir("dmarc");
-    try tmp_dir.dir.makeDir("tlsrpt");
+    try tmp_dir.dir.createDir(io, "dmarc", .default_dir);
+    try tmp_dir.dir.createDir(io, "tlsrpt", .default_dir);
 
     // Write a test file
-    var dmarc_dir = try tmp_dir.dir.openDir("dmarc", .{});
-    defer dmarc_dir.close();
-    var f = try dmarc_dir.createFile("test.json", .{});
-    try f.writeAll("{}");
-    f.close();
+    var dmarc_dir = try tmp_dir.dir.openDir(io, "dmarc", .{});
+    defer dmarc_dir.close(io);
+    var f = try dmarc_dir.createFile(io, "test.json", .{});
+    try f.writeStreamingAll(io, "{}");
+    f.close(io);
 
     // Run migration
-    migrateToAccountDirs(tmp_path);
+    migrateToAccountDirs(io, tmp_path);
 
     // Verify: default/dmarc/test.json should exist
-    const result = tmp_dir.dir.openFile("default/dmarc/test.json", .{});
+    const result = tmp_dir.dir.openFile(io, "default/dmarc/test.json", .{});
     try std.testing.expect(result != error.FileNotFound);
-    if (result) |file| file.close() else |_| {}
+    if (result) |file| file.close(io) else |_| {}
 
     // Legacy dmarc/ should no longer exist
-    const legacy = tmp_dir.dir.openDir("dmarc", .{});
+    const legacy = tmp_dir.dir.openDir(io, "dmarc", .{});
     if (legacy) |*d| {
         var dir = d.*;
-        dir.close();
+        dir.close(io);
         try std.testing.expect(false); // should not reach here
     } else |_| {}
 }

@@ -19,15 +19,15 @@ pub const DmarcStatsJson = struct {
     } = &.{},
 };
 
-pub fn loadEntries(allocator: std.mem.Allocator, cfg: *const Config, account: ?[]const u8) ![]reports.store.ReportEntry {
-    reports.store.migrateToAccountDirs(cfg.data_dir);
+pub fn loadEntries(allocator: std.mem.Allocator, io: std.Io, cfg: *const Config, account: ?[]const u8) ![]reports.store.ReportEntry {
+    reports.store.migrateToAccountDirs(io, cfg.data_dir);
     if (account) |name| {
-        const st = Store.init(allocator, cfg.data_dir, name);
+        const st = Store.init(allocator, io, cfg.data_dir, name);
         return st.listReports();
     }
     const names = try cfg.accountNames(allocator);
     defer allocator.free(names);
-    return reports.store.listAllReports(allocator, cfg.data_dir, names);
+    return reports.store.listAllReports(allocator, io, cfg.data_dir, names);
 }
 
 pub fn accumulateDmarcStats(allocator: std.mem.Allocator, data: []const u8, total: *u64, pass: *u64, fail: *u64) void {
@@ -146,13 +146,13 @@ pub fn isLeapYear(year: u16) bool {
     return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
 }
 
-pub fn dateAgeDays(date_str: []const u8) !u64 {
+pub fn dateAgeDays(date_str: []const u8, now_secs: i64) !u64 {
     if (date_str.len < 10) return error.InvalidDate;
     const year = try std.fmt.parseInt(u16, date_str[0..4], 10);
     const month = try std.fmt.parseInt(u8, date_str[5..7], 10);
     const day = try std.fmt.parseInt(u8, date_str[8..10], 10);
     const epoch = epochDays(year, month, day);
-    const now = @divTrunc(@as(i64, std.time.timestamp()), 86400);
+    const now = @divTrunc(now_secs, 86400);
     if (now < epoch) return 0;
     return @intCast(now - epoch);
 }
@@ -272,15 +272,14 @@ test "epochDays known dates" {
 }
 
 test "dateAgeDays returns 0 for today" {
-    const now_secs = std.time.timestamp();
-    const now_days = @divTrunc(now_secs, 86400);
-    _ = now_days;
-    const age = try dateAgeDays("2020-01-01 00:00");
-    try std.testing.expect(age > 2000);
+    const now_secs = epochDays(2026, 4, 14) * 86400 + 3600;
+    try std.testing.expectEqual(@as(u64, 0), try dateAgeDays("2026-04-14 00:00", now_secs));
+    try std.testing.expectEqual(@as(u64, 0), try dateAgeDays("2026-04-20 00:00", now_secs));
+    try std.testing.expectEqual(@as(u64, 2295), try dateAgeDays("2020-01-01 00:00", now_secs));
 }
 
 test "dateAgeDays returns error for short date" {
-    try std.testing.expectError(error.InvalidDate, dateAgeDays("2020"));
+    try std.testing.expectError(error.InvalidDate, dateAgeDays("2020", 0));
 }
 
 test "formatEpoch returns empty string for zero timestamp" {

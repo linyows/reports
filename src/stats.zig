@@ -528,9 +528,9 @@ test "aggregateTlsReport accumulates across multiple calls" {
     const tls = domain_tls.get("mx.example.com").?;
     try std.testing.expectEqual(@as(u64, 150), tls.success); // 100 + 50
     try std.testing.expectEqual(@as(u64, 3), tls.failure);
-    try std.testing.expectEqual(@as(u64, 253), tls_pt.get("sts").?); // 100 + 50 + 53
+    try std.testing.expectEqual(@as(u64, 153), tls_pt.get("sts").?); // (100 + 0) + (50 + 3)
     try std.testing.expectEqual(@as(u64, 3), tls_ft.get("certificate-expired").?);
-    try std.testing.expectEqual(@as(u64, 253), dom_pt.get("mx.example.com\x00sts").?);
+    try std.testing.expectEqual(@as(u64, 153), dom_pt.get("mx.example.com\x00sts").?);
     try std.testing.expectEqual(@as(u64, 3), dom_ft.get("mx.example.com\x00certificate-expired").?);
 }
 

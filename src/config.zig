@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 pub const Config = struct {
     accounts: []const Account,
@@ -16,18 +17,15 @@ pub const Config = struct {
         tls: bool = true,
     };
 
-    pub fn load(allocator: Allocator) !Config {
-        const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+    pub fn load(allocator: Allocator, io: Io) !Config {
+        const home = getHome() orelse return error.NoHomeDir;
         const config_path = try std.fs.path.join(allocator, &.{ home, ".config", "reports", "config.json" });
         defer allocator.free(config_path);
 
-        const file = std.fs.openFileAbsolute(config_path, .{}) catch |err| switch (err) {
+        const data = Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => return defaultConfig(allocator, home),
             else => return err,
         };
-        defer file.close();
-
-        const data = try file.readToEndAlloc(allocator, 1024 * 1024);
         defer allocator.free(data);
 
         return fromJson(allocator, data);
@@ -38,7 +36,7 @@ pub const Config = struct {
         defer parsed.deinit();
         const j = parsed.value;
 
-        const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+        const home = getHome() orelse return error.NoHomeDir;
 
         const data_dir = if (j.data_dir) |d|
             try allocator.dupe(u8, d)
@@ -123,26 +121,31 @@ pub const Config = struct {
         return names;
     }
 
-    pub fn ensureDataDir(self: *const Config) !void {
-        makeDirIfNotExists(self.data_dir);
+    pub fn ensureDataDir(self: *const Config, io: Io) !void {
+        makeDirIfNotExists(io, self.data_dir);
         for (self.accounts) |a| {
             const acct_dir = try std.fs.path.join(std.heap.page_allocator, &.{ self.data_dir, a.name });
             defer std.heap.page_allocator.free(acct_dir);
-            makeDirIfNotExists(acct_dir);
+            makeDirIfNotExists(io, acct_dir);
 
             const dmarc_dir = try std.fs.path.join(std.heap.page_allocator, &.{ acct_dir, "dmarc" });
             defer std.heap.page_allocator.free(dmarc_dir);
-            makeDirIfNotExists(dmarc_dir);
+            makeDirIfNotExists(io, dmarc_dir);
 
             const tlsrpt_dir = try std.fs.path.join(std.heap.page_allocator, &.{ acct_dir, "tlsrpt" });
             defer std.heap.page_allocator.free(tlsrpt_dir);
-            makeDirIfNotExists(tlsrpt_dir);
+            makeDirIfNotExists(io, tlsrpt_dir);
         }
     }
 };
 
-fn makeDirIfNotExists(path: []const u8) void {
-    std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+fn getHome() ?[]const u8 {
+    const home = std.c.getenv("HOME") orelse return null;
+    return std.mem.span(home);
+}
+
+fn makeDirIfNotExists(io: Io, path: []const u8) void {
+    Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {},
     };

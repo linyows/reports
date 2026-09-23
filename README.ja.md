@@ -63,7 +63,7 @@ graph TD
 
 ### ソースからビルド
 
-Zig 0.15.2以降が必要です。
+Zig 0.16.0以降が必要です。
 
 ```bash
 $ git clone https://github.com/linyows/reports.git
